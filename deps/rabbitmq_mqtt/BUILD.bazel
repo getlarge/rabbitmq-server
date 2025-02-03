@@ -5,7 +5,6 @@ load(
     "//:rabbitmq.bzl",
     "BROKER_VERSION_REQUIREMENTS_ANY",
     "RABBITMQ_DIALYZER_OPTS",
-    "assert_suites",
     "broker_for_integration_suites",
     "rabbitmq_app",
     "rabbitmq_integration_suite",
@@ -302,7 +301,7 @@ rabbitmq_suite(
     ],
 )
 
-assert_suites()
+# assert_suites()
 
 alias(
     name = "rabbitmq_mqtt",

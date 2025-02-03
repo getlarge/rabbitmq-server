@@ -30,6 +30,7 @@
          purge/1,
          update_machine_state/2,
          pending_size/1,
+         num_cached_segments/1,
          stat/1,
          stat/2,
          query_single_active_consumer/1,
@@ -40,8 +41,12 @@
 -define(TIMER_TIME, 10000).
 -define(COMMAND_TIMEOUT, 30000).
 -define(UNLIMITED_PREFETCH_COUNT, 2000). %% something large for ra
+%% controls the timer for closing cached segments
+-define(CACHE_SEG_TIMEOUT, 5000).
 
 -type seq() :: non_neg_integer().
+-type milliseconds() :: non_neg_integer().
+
 
 -record(consumer, {key :: rabbit_fifo:consumer_key(),
                    % status = up :: up | cancelled,
@@ -69,7 +74,11 @@
                 pending = #{} :: #{seq() =>
                                    {term(), rabbit_fifo:command()}},
                 consumers = #{} :: #{rabbit_types:ctag() => #consumer{}},
-                timer_state :: term()
+                timer_state :: term(),
+                cached_segments :: undefined |
+                                  {undefined | reference(),
+                                   LastSeenMs :: milliseconds(),
+                                   ra_flru:state()}
                }).
 
 -opaque state() :: #state{}.
@@ -132,9 +141,15 @@ enqueue(QName, Correlation, Msg,
             %% it is safe to reject the message as we never attempted
             %% to send it
             {reject_publish, State0};
+        {error, {shutdown, delete}} ->
+            rabbit_log:debug("~ts: QQ ~ts tried to register enqueuer during delete shutdown",
+                             [?MODULE, rabbit_misc:rs(QName)]),
+            {reject_publish, State0};
         {timeout, _} ->
             {reject_publish, State0};
         Err ->
+            rabbit_log:debug("~ts: QQ ~ts error when registering enqueuer ~p",
+                             [?MODULE, rabbit_misc:rs(QName), Err]),
             exit(Err)
     end;
 enqueue(_QName, _Correlation, _Msg,
@@ -167,7 +182,7 @@ enqueue(QName, Correlation, Msg,
 %% @param QueueName Name of the queue.
 %% @param Msg an arbitrary erlang term representing the message.
 %% @param State the current {@module} state.
-%% @returns
+%% @return's
 %% `{ok, State, Actions}' if the command was successfully sent.
 %% {@module} assigns a sequence number to every raft command it issues. The
 %% SequenceNumber can be correlated to the applied sequence numbers returned
@@ -510,6 +525,15 @@ purge(Server) ->
 pending_size(#state{pending = Pend}) ->
     maps:size(Pend).
 
+-spec num_cached_segments(state()) -> non_neg_integer().
+num_cached_segments(#state{cached_segments = CachedSegments}) ->
+    case CachedSegments of
+        undefined ->
+            0;
+        {_, _, Cached} ->
+            ra_flru:size(Cached)
+    end.
+
 -spec stat(ra:server_id()) ->
     {ok, non_neg_integer(), non_neg_integer()}
     | {error | timeout, term()}.
@@ -586,26 +610,50 @@ update_machine_state(Server, Conf) ->
                       ra_server_proc:ra_event_body(), state()) ->
     {internal, Correlators :: [term()], rabbit_queue_type:actions(), state()} |
     {rabbit_fifo:client_msg(), state()} | {eol, rabbit_queue_type:actions()}.
-handle_ra_event(QName, From, {applied, Seqs},
-                #state{cfg = #cfg{soft_limit = SftLmt}} = State0) ->
+handle_ra_event(QName, Leader, {applied, Seqs},
+                #state{leader = OldLeader,
+                       cfg = #cfg{soft_limit = SftLmt}} = State0) ->
 
     {Corrs, ActionsRev, State1} = lists:foldl(fun seq_applied/2,
-                                              {[], [], State0#state{leader = From}},
+                                              {[], [], State0#state{leader = Leader}},
                                               Seqs),
+
+    %% if the leader has changed we need to resend any pending commands remaining
+    %% after the applied processing
+    State2 = if OldLeader =/= Leader ->
+                    %% double check before resending as applied notifications
+                    %% can arrive from old leaders in any order
+                    case ra:members(Leader) of
+                        {ok, _, ActualLeader}
+                          when ActualLeader =/= OldLeader ->
+                            %% there is a new leader
+                            rabbit_log:debug("~ts: Detected QQ leader change (applied) "
+                                             "from ~w to ~w, "
+                                             "resending ~b pending commands",
+                                             [?MODULE, OldLeader, ActualLeader,
+                                              maps:size(State1#state.pending)]),
+                            resend_all_pending(State1#state{leader = ActualLeader});
+                        _ ->
+                            State1
+                    end;
+                true ->
+                    State1
+             end,
+
     Actions0 = lists:reverse(ActionsRev),
     Actions = case Corrs of
                   [] ->
                       Actions0;
                   _ ->
-                      %%TODO consider using lists:foldr/3 above because
+                      %%TODO: consider using lists:foldr/3 above because
                       %% Corrs is returned in the wrong order here.
                       %% The wrong order does not matter much because the channel sorts the
                       %% sequence numbers before confirming to the client. But rabbit_fifo_client
                       %% is sequence numer agnostic: it handles any correlation terms.
                       [{settled, QName, Corrs} | Actions0]
               end,
-    case map_size(State1#state.pending) < SftLmt of
-        true when State1#state.slow == true ->
+    case map_size(State2#state.pending) < SftLmt of
+        true when State2#state.slow == true ->
             % we have exited soft limit state
             % send any unsent commands and cancel the time as
             % TODO: really the timer should only be cancelled when the channel
@@ -613,7 +661,7 @@ handle_ra_event(QName, From, {applied, Seqs},
             % channel is interacting with)
             % but the fact the queue has just applied suggests
             % it's ok to cancel here anyway
-            State2 = cancel_timer(State1#state{slow = false,
+            State3 = cancel_timer(State2#state{slow = false,
                                                unsent_commands = #{}}),
             % build up a list of commands to issue
             Commands = maps:fold(
@@ -622,18 +670,19 @@ handle_ra_event(QName, From, {applied, Seqs},
                                              add_command(Cid, return, Returns,
                                                          add_command(Cid, discard,
                                                                      Discards, Acc)))
-                         end, [], State1#state.unsent_commands),
-            ServerId = pick_server(State2),
+                         end, [], State2#state.unsent_commands),
+            ServerId = pick_server(State3),
             %% send all the settlements and returns
             State = lists:foldl(fun (C, S0) ->
                                         send_command(ServerId, undefined, C,
                                                      normal, S0)
-                                end, State2, Commands),
+                                end, State3, Commands),
             {ok, State, [{unblock, cluster_name(State)} | Actions]};
         _ ->
-            {ok, State1, Actions}
+            {ok, State2, Actions}
     end;
-handle_ra_event(QName, From, {machine, {delivery, _ConsumerTag, _} = Del}, State0) ->
+handle_ra_event(QName, From, {machine, Del}, State0)
+      when element(1, Del) == delivery ->
     handle_delivery(QName, From, Del, State0);
 handle_ra_event(_QName, _From, {machine, Action}, State)
   when element(1, Action) =:= credit_reply orelse
@@ -643,28 +692,31 @@ handle_ra_event(_QName, _, {machine, {queue_status, Status}},
                 #state{} = State) ->
     %% just set the queue status
     {ok, State#state{queue_status = Status}, []};
-handle_ra_event(_QName, Leader, {machine, leader_change},
+handle_ra_event(QName, Leader, {machine, leader_change},
                 #state{leader = OldLeader,
                        pending = Pending} = State0) ->
     %% we need to update leader
     %% and resend any pending commands
-    rabbit_log:debug("~ts: Detected QQ leader change from ~w to ~w, "
+    rabbit_log:debug("~ts: ~s Detected QQ leader change from ~w to ~w, "
                      "resending ~b pending commands",
-                     [?MODULE, OldLeader, Leader, maps:size(Pending)]),
+                     [rabbit_misc:rs(QName), ?MODULE, OldLeader,
+                      Leader, maps:size(Pending)]),
     State = resend_all_pending(State0#state{leader = Leader}),
     {ok, State, []};
 handle_ra_event(_QName, _From, {rejected, {not_leader, Leader, _Seq}},
                 #state{leader = Leader} = State) ->
     {ok, State, []};
-handle_ra_event(_QName, _From, {rejected, {not_leader, Leader, _Seq}},
+handle_ra_event(QName, _From, {rejected, {not_leader, Leader, _Seq}},
                 #state{leader = OldLeader,
                        pending = Pending} = State0) ->
-    rabbit_log:debug("~ts: Detected QQ leader change (rejection) from ~w to ~w, "
+    rabbit_log:debug("~ts: ~s Detected QQ leader change (rejection) from ~w to ~w, "
                      "resending ~b pending commands",
-                     [?MODULE, OldLeader, Leader, maps:size(Pending)]),
+                     [rabbit_misc:rs(QName), ?MODULE, OldLeader,
+                      Leader, maps:size(Pending)]),
     State = resend_all_pending(State0#state{leader = Leader}),
     {ok, cancel_timer(State), []};
-handle_ra_event(_QName, _From, {rejected, {not_leader, _UndefinedMaybe, _Seq}}, State0) ->
+handle_ra_event(_QName, _From,
+                {rejected, {not_leader, _UndefinedMaybe, _Seq}}, State0) ->
     % TODO: how should these be handled? re-sent on timer or try random
     {ok, State0, []};
 handle_ra_event(QName, _, timeout, #state{cfg = #cfg{servers = Servers}} = State0) ->
@@ -676,6 +728,30 @@ handle_ra_event(QName, _, timeout, #state{cfg = #cfg{servers = Servers}} = State
             State = resend_all_pending(State0#state{leader = Leader}),
             {ok, State, []}
     end;
+handle_ra_event(QName, Leader, close_cached_segments,
+                #state{cached_segments = CachedSegments} = State) ->
+    {ok,
+     case CachedSegments of
+         undefined ->
+             %% timer didn't get cancelled so just ignore this
+             State;
+         {_TRef, Last, Cache} ->
+             case now_ms() > Last + ?CACHE_SEG_TIMEOUT of
+                 true ->
+                     rabbit_log:debug("~ts: closing_cached_segments",
+                                      [rabbit_misc:rs(QName)]),
+                     %% its been long enough, evict all
+                     _ = ra_flru:evict_all(Cache),
+                     State#state{cached_segments = undefined};
+                 false ->
+                     %% set another timer
+                     Ref = erlang:send_after(?CACHE_SEG_TIMEOUT, self(),
+                                             {'$gen_cast',
+                                              {queue_event, QName,
+                                               {Leader, close_cached_segments}}}),
+                     State#state{cached_segments = {Ref, Last, Cache}}
+             end
+     end, []};
 handle_ra_event(_QName, _Leader, {machine, eol}, State) ->
     {eol, [{unblock, cluster_name(State)}]}.
 
@@ -839,7 +915,39 @@ handle_delivery(_QName, _Leader, {delivery, Tag, [_ | _] = IdMsgs},
     %% we should return all messages.
     MsgIntIds = [Id || {Id, _} <- IdMsgs],
     {State1, Deliveries} = return(Tag, MsgIntIds, State0),
-    {ok, State1, Deliveries}.
+    {ok, State1, Deliveries};
+handle_delivery(QName, Leader, {delivery, Tag, ReadPlan, Msgs},
+                #state{cached_segments = CachedSegments} = State) ->
+    {TRef, Cached0} = case CachedSegments of
+                          undefined ->
+                              {undefined, undefined};
+                          {R, _, C} ->
+                              {R, C}
+                      end,
+    {MsgIds, Cached1} = rabbit_fifo:exec_read(Cached0, ReadPlan, Msgs),
+    %% if there are cached segments after a read and there
+    %% is no current timer set, set a timer
+    %% send a message to evict cache after some time
+    Cached = case ra_flru:size(Cached1) > 0 of
+                 true when TRef == undefined ->
+                     Ref = erlang:send_after(?CACHE_SEG_TIMEOUT, self(),
+                                             {'$gen_cast',
+                                              {queue_event, QName,
+                                               {Leader, close_cached_segments}}}),
+                     {Ref, now_ms(), Cached1};
+                 true ->
+                     {TRef, now_ms(), Cached1};
+                 false when is_reference(TRef) ->
+                     %% the time is (potentially) alive and may as well be
+                     %% cancelled here
+                     _ = erlang:cancel_timer(TRef, [{async, true},
+                                                    {info, false}]),
+                     undefined;
+                 false  ->
+                     undefined
+             end,
+    handle_delivery(QName, Leader, {delivery, Tag, MsgIds},
+                    State#state{cached_segments = Cached}).
 
 transform_msgs(QName, QRef, Msgs) ->
     lists:map(
@@ -1008,3 +1116,6 @@ send_pending(Cid, #state{unsent_commands = Unsent} = State0) ->
                                               normal, S0)
                          end, State0, Commands),
     State1#state{unsent_commands = maps:remove(Cid, Unsent)}.
+
+now_ms() ->
+    erlang:system_time(millisecond).

@@ -184,6 +184,7 @@
          messages_uncommitted,
          acks_uncommitted,
          pending_raft_commands,
+         cached_segments,
          prefetch_count,
          state,
          garbage_collection]).
@@ -297,22 +298,11 @@ send_command(Pid, Msg) ->
 
 -spec deliver_reply(binary(), mc:state()) -> 'ok'.
 deliver_reply(<<"amq.rabbitmq.reply-to.", EncodedBin/binary>>, Message) ->
-    case rabbit_direct_reply_to:decode_reply_to_v2(EncodedBin,
-                                                   rabbit_nodes:all_running_with_hashes()) of
+    Nodes = rabbit_nodes:all_running_with_hashes(),
+    case rabbit_direct_reply_to:decode_reply_to(EncodedBin, Nodes) of
         {ok, Pid, Key} ->
-            delegate:invoke_no_result(Pid, {?MODULE, deliver_reply_local,
-                                            [Key, Message]});
-        {error, _} ->
-            deliver_reply_v1(EncodedBin, Message)
-    end.
-
--spec deliver_reply_v1(binary(), mc:state()) -> 'ok'.
-deliver_reply_v1(EncodedBin, Message) ->
-    %% the the original encoding function
-    case rabbit_direct_reply_to:decode_reply_to_v1(EncodedBin) of
-        {ok, V1Pid, V1Key} ->
-            delegate:invoke_no_result(V1Pid,
-                                      {?MODULE, deliver_reply_local, [V1Key, Message]});
+            delegate:invoke_no_result(
+              Pid, {?MODULE, deliver_reply_local, [Key, Message]});
         {error, _} ->
             ok
     end.
@@ -331,29 +321,18 @@ deliver_reply_local(Pid, Key, Message) ->
 declare_fast_reply_to(<<"amq.rabbitmq.reply-to">>) ->
     exists;
 declare_fast_reply_to(<<"amq.rabbitmq.reply-to.", EncodedBin/binary>>) ->
-    case rabbit_direct_reply_to:decode_reply_to_v2(EncodedBin, rabbit_nodes:all_running_with_hashes()) of
-        {error, _} ->
-            declare_fast_reply_to_v1(EncodedBin);
+    Nodes = rabbit_nodes:all_running_with_hashes(),
+    case rabbit_direct_reply_to:decode_reply_to(EncodedBin, Nodes) of
         {ok, Pid, Key} ->
             Msg = {declare_fast_reply_to, Key},
             rabbit_misc:with_exit_handler(
               rabbit_misc:const(not_found),
-              fun() -> gen_server2:call(Pid, Msg, infinity) end)
+              fun() -> gen_server2:call(Pid, Msg, infinity) end);
+        {error, _} ->
+            not_found
     end;
 declare_fast_reply_to(_) ->
     not_found.
-
-declare_fast_reply_to_v1(EncodedBin) ->
-    %% the the original encoding function
-    case rabbit_direct_reply_to:decode_reply_to_v1(EncodedBin) of
-        {ok, V1Pid, V1Key} ->
-            Msg = {declare_fast_reply_to, V1Key},
-            rabbit_misc:with_exit_handler(
-              rabbit_misc:const(not_found),
-              fun() -> gen_server2:call(V1Pid, Msg, infinity) end);
-        {error, _} ->
-            not_found
-    end.
 
 -spec list() -> [pid()].
 
@@ -570,8 +549,6 @@ prioritise_cast(Msg, _Len, _State) ->
     case Msg of
         {confirm,            _MsgSeqNos, _QPid} -> 5;
         {reject_publish,     _MsgSeqNos, _QPid} -> 5;
-        {queue_event, _, {confirm,            _MsgSeqNos, _QPid}} -> 5;
-        {queue_event, _, {reject_publish,     _MsgSeqNos, _QPid}} -> 5;
         _                                       -> 0
     end.
 
@@ -661,10 +638,14 @@ handle_cast(terminate, State = #ch{cfg = #conf{writer_pid = WriterPid}}) ->
     ok = rabbit_writer:flush(WriterPid),
     {stop, normal, State};
 
-handle_cast({command, #'basic.consume_ok'{consumer_tag = CTag} = Msg}, State) ->
+handle_cast({command, #'basic.consume_ok'{consumer_tag = CTag} = Msg},
+            #ch{consumer_mapping = CMap} = State)
+  when is_map_key(CTag, CMap) ->
     ok = send(Msg, State),
     noreply(consumer_monitor(CTag, State));
-
+handle_cast({command, #'basic.consume_ok'{}}, State) ->
+    %% a consumer was not found so just ignore this
+    noreply(State);
 handle_cast({command, Msg}, State) ->
     ok = send(Msg, State),
     noreply(State);
@@ -1319,7 +1300,7 @@ handle_method(#'basic.consume'{queue        = <<"amq.rabbitmq.reply-to">>,
                                Other -> Other
                            end,
                     %% Precalculate both suffix and key
-                    {Key, Suffix} = rabbit_direct_reply_to:compute_key_and_suffix_v2(self()),
+                    {Key, Suffix} = rabbit_direct_reply_to:compute_key_and_suffix(self()),
                     Consumer = {CTag, Suffix, Key},
                     State1 = State#ch{reply_consumer = Consumer},
                     case NoWait of
@@ -2281,6 +2262,8 @@ i(acks_uncommitted,        #ch{tx = {_Msgs, Acks}})       -> ack_len(Acks);
 i(acks_uncommitted,        #ch{})                         -> 0;
 i(pending_raft_commands,   #ch{queue_states = QS}) ->
     pending_raft_commands(QS);
+i(cached_segments,   #ch{queue_states = QS}) ->
+    cached_segments(QS);
 i(state,                   #ch{cfg = #conf{state = running}}) -> credit_flow:state();
 i(state,                   #ch{cfg = #conf{state = State}}) -> State;
 i(prefetch_count,          #ch{cfg = #conf{consumer_prefetch = C}})    -> C;
@@ -2302,6 +2285,17 @@ pending_raft_commands(QStates) ->
     Fun = fun(_, V, Acc) ->
                   case rabbit_queue_type:state_info(V) of
                       #{pending_raft_commands := P} ->
+                          Acc + P;
+                      _ ->
+                          Acc
+                  end
+          end,
+    rabbit_queue_type:fold_state(Fun, 0, QStates).
+
+cached_segments(QStates) ->
+    Fun = fun(_, V, Acc) ->
+                  case rabbit_queue_type:state_info(V) of
+                      #{cached_segments := P} ->
                           Acc + P;
                       _ ->
                           Acc
