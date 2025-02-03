@@ -12,6 +12,7 @@ define PROJECT_ENV
 	    {retained_message_store, rabbit_mqtt_retained_msg_store_dets},
 	    %% only used by DETS store
 	    {retained_message_store_dets_sync_interval, 2000},
+			{retained_message_store_max_retained_messages_count, 2000},
 	    {prefetch, 10},
 	    {ssl_listeners, []},
 	    {tcp_listeners, [1883]},
@@ -94,7 +95,7 @@ define ct_master.erl
 	halt(0)
 endef
 
-PARALLEL_CT_SET_1_A = auth retainer federation feature_flag
+PARALLEL_CT_SET_1_A = auth rabbit_mqtt_retained_msg_store retainer federation feature_flag
 PARALLEL_CT_SET_1_B = cluster command config config_schema mc_mqtt packet_prop \
     processor protocol_interop proxy_protocol rabbit_mqtt_confirms reader util
 PARALLEL_CT_SET_1_C = java v5
