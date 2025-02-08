@@ -118,9 +118,13 @@ test_delete(Config) ->
               timestamp = os:system_time(second)},
   ok = Mod:insert(<<"a/b/c">>, Msg1, State),
   ok = Mod:delete(<<"a/b/c">>, State),
-  Matches = Mod:lookup(<<"a/b/c">>, State),
+  Matches1 = Mod:lookup(<<"a/b/c">>, State),
+  Matches2 = Mod:lookup(<<"a/b/+">>, State),
+  Matches3 = Mod:lookup(<<"a/#">>, State),
 
-  ?assertEqual([], Matches).
+  ?assertEqual([], Matches1),
+  ?assertEqual([], Matches2),
+  ?assertEqual([], Matches3).
 
 test_plus_wildcard(Config) ->
   State = ?config(store_state, Config),
