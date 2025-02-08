@@ -999,21 +999,22 @@ send_retained_message(TopicFilter0, SubscribeQos,
         Msgs when is_list(Msgs) ->
             lists:foldl(
               fun(Msg, S) ->
-                  send_retained_message_to_client(Msg, TopicFilter, SubscribeQos, S)
+                  send_retained_message_to_client(Msg, SubscribeQos, S)
               end, State0, Msgs);
         #mqtt_msg{} = SingleMsg ->
-            send_retained_message_to_client(SingleMsg, TopicFilter, SubscribeQos, State0)
+            send_retained_message_to_client(SingleMsg, SubscribeQos, State0)
     end.
 
 send_retained_message_to_client(#mqtt_msg{qos = MsgQos,
                                         retain = Retain,
+                                        topic = Topic0,
                                         payload = Payload,
                                         props = Props0},
-                               TopicFilter,
                                SubscribeQos,
                                State0 = #state{packet_id = PacketId0}) ->
     Qos = effective_qos(MsgQos, SubscribeQos),
-    {Topic, Props, State1} = process_topic_alias_outbound(TopicFilter, Props0, State0),
+    Topic1 = amqp_to_mqtt(Topic0),
+    {Topic, Props, State1} = process_topic_alias_outbound(Topic1, Props0, State0),
     {PacketId, State} = case Qos of
                            ?QOS_0 ->
                                {undefined, State1};

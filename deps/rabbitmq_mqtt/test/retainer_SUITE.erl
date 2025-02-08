@@ -246,7 +246,7 @@ retained_wildcard_single_level(Config) ->
     ok =
         emqtt:publish(C, <<"devices/sensor1/temperature">>, #{}, <<"23.5">>, [{retain, true}]),
     {ok, _, _} = emqtt:subscribe(C, <<"devices/+/temperature">>, qos1),
-    ok = expect_publishes(C, <<"devices/+/temperature">>, [<<"23.5">>]),
+    ok = expect_publishes(C, <<"devices/sensor1/temperature">>, [<<"23.5">>]),
     ok = emqtt:disconnect(C).
 
 %% Test multi-level wildcard (#)
@@ -259,7 +259,7 @@ retained_wildcard_multi_level(Config) ->
                       <<"23.5">>,
                       [{retain, true}]),
     {ok, _, _} = emqtt:subscribe(C, <<"devices/#">>, qos1),
-    ok = expect_publishes(C, <<"devices/#">>, [<<"23.5">>]),
+    ok = expect_publishes(C, <<"devices/sensor1/readings/temperature">>, [<<"23.5">>]),
     ok = emqtt:disconnect(C).
 
 %% Test mixed wildcards (+/#)
@@ -272,5 +272,5 @@ retained_wildcard_mixed(Config) ->
                       <<"23.5">>,
                       [{retain, true}]),
     {ok, _, _} = emqtt:subscribe(C, <<"devices/+/readings/#">>, qos1),
-    ok = expect_publishes(C, <<"devices/+/readings/#">>, [<<"23.5">>]),
+    ok = expect_publishes(C, <<"devices/sensor1/readings/temperature">>, [<<"23.5">>]),
     ok = emqtt:disconnect(C).
