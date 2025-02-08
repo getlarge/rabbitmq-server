@@ -32,7 +32,10 @@ tests() ->
      should_translate_amqp2mqtt_on_retention_search,
      recover,
      recover_with_message_expiry_interval,
-    retained_wildcard_single_level, retained_wildcard_multi_level, retained_wildcard_mixed].
+     retained_wildcard_single_level,
+     retained_wildcard_multi_level,
+     retained_wildcard_mixed,
+     should_remove_from_retained].
 
 suite() ->
     [{timetrap, {minutes, 2}}].
@@ -273,4 +276,23 @@ retained_wildcard_mixed(Config) ->
                       [{retain, true}]),
     {ok, _, _} = emqtt:subscribe(C, <<"devices/+/readings/#">>, qos1),
     ok = expect_publishes(C, <<"devices/sensor1/readings/temperature">>, [<<"23.5">>]),
+    ok = emqtt:disconnect(C).
+
+should_remove_from_retained(Config) ->
+    C = connect(<<"wildcardClientRetainer">>, Config, [{ack_timeout, 1}]),
+    ok =
+        emqtt:publish(C,
+                      <<"devices/sensor1/readings/temperature">>,
+                      #{},
+                      <<"23.5">>,
+                      [{retain, true}]),
+    ok =
+        emqtt:publish(C, <<"devices/sensor1/readings/temperature">>, #{}, <<>>, [{retain, true}]),
+    {ok, _, _} = emqtt:subscribe(C, <<"devices/sensor1/readings/temperature">>, qos1),
+    receive
+        Unexpected ->
+            ct:fail("Unexpected message: ~p", [Unexpected])
+    after 1000 ->
+        ok
+    end,
     ok = emqtt:disconnect(C).
