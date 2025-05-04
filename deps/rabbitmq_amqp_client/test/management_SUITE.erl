@@ -52,6 +52,7 @@ groups() ->
        bad_exchange_property,
        bad_exchange_type,
        get_queue_not_found,
+       declare_queues_concurrently,
        declare_queue_default_queue_type,
        declare_queue_empty_name,
        declare_queue_line_feed,
@@ -432,6 +433,40 @@ get_queue_not_found(Config) ->
                  amqp10_msg:body(Resp)),
     ok = cleanup(Init).
 
+declare_queues_concurrently(Config) ->
+    NumQueues = 5,
+    {Pid1, Ref1} = spawn_monitor(?MODULE, declare_queues, [Config, NumQueues]),
+    {Pid2, Ref2} = spawn_monitor(?MODULE, declare_queues, [Config, NumQueues]),
+    receive {'DOWN', Ref1, process, Pid1, Reason1} ->
+                ?assertEqual(normal, Reason1)
+    end,
+    receive {'DOWN', Ref2, process, Pid2, Reason2} ->
+                ?assertEqual(normal, Reason2)
+    end,
+
+    ?assertEqual(NumQueues, count_queues(Config)),
+
+    Init = {_, LinkPair} = init(Config),
+    lists:foreach(fun(N) ->
+                          Bin = integer_to_binary(N),
+                          QName = <<"queue-", Bin/binary>>,
+                          {ok, _} = rabbitmq_amqp_client:delete_queue(LinkPair, QName)
+                  end, lists:seq(1, NumQueues)),
+    ok = cleanup(Init).
+
+declare_queues(Config, Num) ->
+    Init = {_, LinkPair} = init(Config),
+    ok = declare_queues0(LinkPair, Num),
+    ok = cleanup(Init).
+
+declare_queues0(_LinkPair, 0) ->
+    ok;
+declare_queues0(LinkPair, Left) ->
+    Bin = integer_to_binary(Left),
+    QName = <<"queue-", Bin/binary>>,
+    ?assertMatch({ok, _}, rabbitmq_amqp_client:declare_queue(LinkPair, QName, #{})),
+    declare_queues0(LinkPair, Left - 1).
+
 declare_queue_default_queue_type(Config) ->
     Node = get_node_config(Config, 0, nodename),
     Vhost = QName = atom_to_binary(?FUNCTION_NAME),
@@ -803,16 +838,28 @@ queue_topology(Config) ->
     {ok, QQInfo0} = rabbitmq_amqp_client:declare_queue(LinkPair0, QQName, QQProps),
     {ok, SQInfo0} = rabbitmq_amqp_client:declare_queue(LinkPair0, SQName, SQProps),
 
-    %% The default queue leader strategy is client-local.
-    ?assertEqual({ok, N0}, maps:find(leader, CQInfo0)),
-    ?assertEqual({ok, N0}, maps:find(leader, QQInfo0)),
-    ?assertEqual({ok, N0}, maps:find(leader, SQInfo0)),
-
     ?assertEqual({ok, [N0]}, maps:find(replicas, CQInfo0)),
     {ok, QQReplicas0} = maps:find(replicas, QQInfo0),
     ?assertEqual(Nodes, lists:usort(QQReplicas0)),
     {ok, SQReplicas0} = maps:find(replicas, SQInfo0),
     ?assertEqual(Nodes, lists:usort(SQReplicas0)),
+
+    %% The default queue leader strategy is client-local.
+    ?assertEqual({ok, N0}, maps:find(leader, CQInfo0)),
+    eventually(
+      ?_assert(
+         begin
+             {ok, QQInfo1} = rabbitmq_amqp_client:get_queue(LinkPair0, QQName),
+             {ok, SQInfo1} = rabbitmq_amqp_client:get_queue(LinkPair0, SQName),
+             QQLeader = maps:get(leader, QQInfo1),
+             SQLeader = maps:get(leader, SQInfo1),
+             ct:pal("quorum queue leader: ~s~n"
+                    "stream leader: ~s",
+                    [QQLeader, SQLeader]),
+             QQLeader =:= N0 andalso
+             SQLeader =:= N0
+         end
+        ), 2000, 5),
 
     ok = cleanup(Init0),
     ok = rabbit_ct_broker_helpers:stop_node(Config, 0),
@@ -841,7 +888,7 @@ queue_topology(Config) ->
              (QQLeader =:= N1 orelse QQLeader =:= N2) andalso
              (SQLeader =:= N1 orelse SQLeader =:= N2)
          end
-        ), 1000, 5),
+        ), 2000, 5),
 
     ok = rabbit_ct_broker_helpers:start_node(Config, 0),
     {ok, _} = rabbitmq_amqp_client:delete_queue(LinkPair2, CQName),
@@ -859,11 +906,11 @@ pipeline(Config) ->
     %% because RabbitMQ grants us 8 link credits initially.
     Num = 8,
     pipeline0(Num, LinkPair, <<"PUT">>, {map, []}),
-    eventually(?_assertEqual(Num, rpc(Config, rabbit_amqqueue, count, [])), 200, 20),
+    eventually(?_assertEqual(Num, count_queues(Config)), 200, 20),
     flush(queues_created),
 
     pipeline0(Num, LinkPair, <<"DELETE">>, null),
-    eventually(?_assertEqual(0, rpc(Config, rabbit_amqqueue, count, [])), 200, 20),
+    eventually(?_assertEqual(0, count_queues(Config)), 200, 20),
     flush(queues_deleted),
 
     ok = cleanup(Init).
@@ -1015,7 +1062,7 @@ session_flow_control(Config) ->
 
     ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
     %% Close our incoming window.
-    gen_statem:cast(Session, {flow_session, #'v1_0.flow'{incoming_window = {uint, 0}}}),
+    amqp10_client_session:flow(Session, 0, never),
 
     Request0 = amqp10_msg:new(<<>>, #'v1_0.amqp_value'{content = null}, true),
     MessageId = <<1>>,
@@ -1031,7 +1078,7 @@ session_flow_control(Config) ->
     end,
 
     %% Open our incoming window
-    gen_statem:cast(Session, {flow_session, #'v1_0.flow'{incoming_window = {uint, 5}}}),
+    amqp10_client_session:flow(Session, 1, never),
 
     receive {amqp10_msg, IncomingLink, Response} ->
                 ?assertMatch(#{correlation_id := MessageId,
@@ -1115,3 +1162,6 @@ gen_server_state(Pid) ->
     L1 = lists:last(L0),
     {data, L2} = lists:last(L1),
     proplists:get_value("State", L2).
+
+count_queues(Config) ->
+    rpc(Config, rabbit_amqqueue, count, []).

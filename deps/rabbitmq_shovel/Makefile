@@ -23,9 +23,9 @@ dep_amqp10_client = git https://github.com/rabbitmq/rabbitmq-amqp1.0-client.git 
 
 LOCAL_DEPS = crypto
 
-TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_amqp1_0 meck
+TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_amqp1_0 rabbitmq_amqp_client meck
 
-PLT_APPS += rabbitmqctl
+PLT_APPS += rabbitmq_cli
 
 DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-plugin.mk
 DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk elvis_mk

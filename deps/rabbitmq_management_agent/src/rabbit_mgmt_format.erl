@@ -279,12 +279,21 @@ listener(#listener{node = Node, protocol = Protocol,
      {protocol, Protocol},
      {ip_address, ip(IPAddress)},
      {port, Port},
-     {socket_opts, format_socket_opts(Opts)}].
+     {socket_opts, format_socket_opts(Opts)},
+     {tls, has_tls_enabled(Opts)}
+    ].
 
 web_context(Props0) ->
     SslOpts = pget(ssl_opts, Props0, []),
     Props   = proplists:delete(ssl_opts, Props0),
     [{ssl_opts, format_socket_opts(SslOpts)} | Props].
+
+has_tls_enabled(Opts) ->
+    S = proplists:get_value(socket_opts, Opts, Opts),
+    (proplists:get_value(ssl_opts, S, undefined) =/= undefined) orelse
+    (proplists:get_value(cacertfile, S, undefined) =/= undefined) orelse
+    (proplists:get_value(certfile, S, undefined) =/= undefined) orelse
+    (proplists:get_value(keyfile, S, undefined) =/= undefined).
 
 format_socket_opts(Opts) ->
     format_socket_opts(Opts, []).

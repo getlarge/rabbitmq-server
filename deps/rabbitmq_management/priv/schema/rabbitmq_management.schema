@@ -37,6 +37,15 @@ fun(Conf) ->
 end}.
 
 
+%% Number of delegate processes to use for metrics acquisition intra-cluster
+%% communication. On a machine which has a very large number of cores and is
+%% also part of a cluster, you may wish to increase this value.
+%%
+
+{mapping, "management.delegate_count", "rabbitmq_management.delegate_count", [
+    {datatype, integer}, {validators, ["non_negative_integer"]}
+]}.
+
 %% HTTP (TCP) listener options ========================================================
 
 %% HTTP listener consistent with Web STOMP and Web MQTT.
@@ -642,6 +651,13 @@ end}.
 %% Disables add/remove/grow/shrink over API.
 
 {mapping, "management.restrictions.quorum_queue_replica_operations.disabled", "rabbitmq_management.restrictions.quorum_queue_replica_operations.disabled", [
+    {datatype, {enum, [true, false]}},
+    {include_default, false}
+]}.
+
+%% Require authentication for the HTTP API reference page.
+
+{mapping, "management.require_auth_for_api_reference", "rabbitmq_management.require_auth_for_api_reference", [
     {datatype, {enum, [true, false]}},
     {include_default, false}
 ]}.

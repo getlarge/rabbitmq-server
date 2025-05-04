@@ -37,6 +37,7 @@ elvis
 !/deps/rabbitmq_amqp_client/
 !/deps/rabbitmq_auth_backend_cache/
 !/deps/rabbitmq_auth_backend_http/
+!/deps/rabbitmq_auth_backend_internal_loopback/
 !/deps/rabbitmq_auth_backend_ldap/
 !/deps/rabbitmq_auth_backend_oauth2/
 !/deps/rabbitmq_auth_mechanism_ssl/
@@ -92,12 +93,6 @@ rebar3.crashdump
 rebar.config
 !/deps/amqp10_common/rebar.config
 !/rebar.config
-
-# Bazel.
-.bazelrc
-user.bazelrc
-bazel-*
-extra_deps/
 
 # Erlang/OTP unwanted files.
 .erlang.cookie

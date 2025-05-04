@@ -159,7 +159,8 @@ define test_rabbitmq_config
 [
   {rabbit, [
 $(if $(RABBITMQ_NODE_PORT),      {tcp_listeners$(comma) [$(RABBITMQ_NODE_PORT)]}$(comma),)
-      {loopback_users, []}
+      {loopback_users, []},
+      {cluster_name, "localhost"}
     ]},
   {rabbitmq_management, [
 $(if $(RABBITMQ_NODE_PORT),      {listener$(comma) [{port$(comma) $(shell echo "$$(($(RABBITMQ_NODE_PORT) + 10000))")}]},)
@@ -322,10 +323,13 @@ start-background-broker: node-tmpdir $(DIST_TARGET)
 	$(BASIC_SCRIPT_ENV_SETTINGS) \
 	  $(RABBITMQ_SERVER) \
 	  $(REDIRECT_STDIO) &
+	trap 'test "$$?" = 0 || $(MAKE) stop-node' EXIT && \
 	ERL_LIBS="$(DIST_ERL_LIBS)" \
 	  $(RABBITMQCTL) -n $(RABBITMQ_NODENAME) wait --timeout $(RMQCTL_WAIT_TIMEOUT) $(RABBITMQ_PID_FILE) && \
-	ERL_LIBS="$(DIST_ERL_LIBS)" \
-	  $(RABBITMQCTL) --node $(RABBITMQ_NODENAME) await_startup
+	for i in $$(seq 1 10); do \
+	  ERL_LIBS="$(DIST_ERL_LIBS)" $(RABBITMQCTL) -n $(RABBITMQ_NODENAME) await_startup || sleep 1; \
+	done && \
+	ERL_LIBS="$(DIST_ERL_LIBS)" $(RABBITMQCTL) -n $(RABBITMQ_NODENAME) await_startup
 
 start-rabbit-on-node:
 	$(exec_verbose) ERL_LIBS="$(DIST_ERL_LIBS)" \
@@ -378,6 +382,7 @@ start-brokers start-cluster: $(DIST_TARGET)
 		  RABBITMQ_NODE_PORT="$$((5672 + $$n - 1))" \
 		  RABBITMQ_SERVER_START_ARGS=" \
 		  -rabbit loopback_users [] \
+		  -rabbit cluster_name localhost \
 		  -rabbitmq_management listener [{port,$$((15672 + $$n - 1))}] \
 		  -rabbitmq_mqtt tcp_listeners [$$((1883 + $$n - 1))] \
 		  -rabbitmq_web_mqtt tcp_config [{port,$$((1893 + $$n - 1))}] \

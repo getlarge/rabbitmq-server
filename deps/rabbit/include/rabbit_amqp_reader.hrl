@@ -3,6 +3,8 @@
 -define(CLOSING_TIMEOUT, 30_000).
 -define(SILENT_CLOSE_DELAY, 3_000).
 
+-define(SHUTDOWN_SESSIONS_TIMEOUT, 10_000).
+
 %% Allow for potentially large sets of tokens during the SASL exchange.
 %% https://docs.oasis-open.org/amqp/amqp-cbs/v1.0/csd01/amqp-cbs-v1.0-csd01.html#_Toc67999915
 -define(INITIAL_MAX_FRAME_SIZE, 8192).
@@ -57,7 +59,10 @@
          buf :: list(),
          buf_len :: non_neg_integer(),
          tracked_channels = maps:new() :: #{channel_number() => Session :: pid()},
-         stats_timer :: rabbit_event:state()
+         stats_timer :: rabbit_event:state(),
+         %% dynamic buffer
+         dynamic_buffer_size = 128,
+         dynamic_buffer_moving_average = 0.0
         }).
 
 -type state() :: #v1{}.

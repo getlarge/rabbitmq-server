@@ -57,7 +57,7 @@ jobs:
       uses: dsaltares/fetch-gh-release-asset@master
       if: inputs.mixed_clusters
       with:
-        version: 'tags/v4.0.5'
+        version: 'tags/v4.0.9'
         regex: true
         file: "rabbitmq-server-generic-unix-\\d.+\\.tar\\.xz"
         target: ./
@@ -90,6 +90,7 @@ jobs:
     - name: RUN TESTS
       if: inputs.plugin != 'rabbitmq_cli'
       run: |
+        sudo netstat -ntp
         make -C deps/${{ inputs.plugin }} ${{ inputs.make_target }} RABBITMQ_METADATA_STORE=${{ inputs.metadata_store }}
 
     # rabbitmq_cli needs a correct broker version for two of its tests.

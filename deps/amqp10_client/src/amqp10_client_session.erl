@@ -20,9 +20,12 @@
          attach/2,
          detach/2,
          transfer/3,
-         flow/4,
-         disposition/5
+         disposition/5,
+         flow_link/4
         ]).
+
+%% Manual session flow control is currently only used in tests.
+-export([flow/3]).
 
 %% Private API
 -export([start_link/4,
@@ -51,7 +54,8 @@
         [add/2,
          diff/2]).
 
--define(MAX_SESSION_WINDOW_SIZE, 65535).
+%% By default, we want to keep the server's remote-incoming-window large at all times.
+-define(DEFAULT_MAX_INCOMING_WINDOW, 100_000).
 -define(UINT_OUTGOING_WINDOW, {uint, ?UINT_MAX}).
 -define(INITIAL_OUTGOING_DELIVERY_ID, ?UINT_MAX).
 %% "The next-outgoing-id MAY be initialized to an arbitrary value" [2.5.6]
@@ -61,9 +65,12 @@
 -define(INITIAL_DELIVERY_COUNT, ?UINT_MAX - 2).
 
 -type link_name() :: binary().
--type link_address() :: binary().
+%% https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-messaging-v1.0-os.html#type-address-string
+%% or
+%% https://docs.oasis-open.org/amqp/anonterm/v1.0/anonterm-v1.0.html
+-type terminus_address() :: binary() | null.
 -type link_role() :: sender | receiver.
--type link_target() :: {pid, pid()} | binary() | undefined.
+-type link_target() :: {pid, pid()} | terminus_address() | undefined.
 %% "The locally chosen handle is referred to as the output handle." [2.6.2]
 -type output_handle() :: link_handle().
 %% "The remotely chosen handle is referred to as the input handle." [2.6.2]
@@ -71,9 +78,9 @@
 
 -type terminus_durability() :: none | configuration | unsettled_state.
 
--type target_def() :: #{address => link_address(),
+-type target_def() :: #{address => terminus_address(),
                         durable => terminus_durability()}.
--type source_def() :: #{address => link_address(),
+-type source_def() :: #{address => terminus_address(),
                         durable => terminus_durability()}.
 
 -type attach_role() :: {sender, target_def()} | {receiver, source_def(), pid()}.
@@ -108,6 +115,7 @@
               terminus_durability/0,
               attach_args/0,
               attach_role/0,
+              terminus_address/0,
               target_def/0,
               source_def/0,
               filter/0,
@@ -129,7 +137,8 @@
          available = 0 :: non_neg_integer(),
          drain = false :: boolean(),
          partial_transfers :: undefined | {#'v1_0.transfer'{}, [binary()]},
-         auto_flow :: never | {auto, RenewWhenBelow :: pos_integer(), Credit :: pos_integer()},
+         auto_flow :: never | {RenewWhenBelow :: pos_integer(),
+                               Credit :: pos_integer()},
          incoming_unsettled = #{} :: #{delivery_number() => ok},
          footer_opt :: footer_opt() | undefined
         }).
@@ -140,7 +149,10 @@
 
          %% session flow control, see section 2.5.6
          next_incoming_id :: transfer_number() | undefined,
-         incoming_window = ?MAX_SESSION_WINDOW_SIZE :: non_neg_integer(),
+         %% Can become negative if the peer overshoots our window.
+         incoming_window :: integer(),
+         auto_flow :: never | {RenewWhenBelow :: pos_integer(),
+                               NewWindowSize :: pos_integer()},
          next_outgoing_id = ?INITIAL_OUTGOING_TRANSFER_ID :: transfer_number(),
          remote_incoming_window = 0 :: non_neg_integer(),
          remote_outgoing_window = 0 :: non_neg_integer(),
@@ -200,7 +212,17 @@ transfer(Session, Amqp10Msg, Timeout) ->
     [Transfer | Sections] = amqp10_msg:to_amqp_records(Amqp10Msg),
     gen_statem:call(Session, {transfer, Transfer, Sections}, Timeout).
 
-flow(Session, Handle, Flow, RenewWhenBelow) ->
+-spec flow(pid(), non_neg_integer(), never | pos_integer()) -> ok.
+flow(Session, IncomingWindow, RenewWhenBelow) when
+      %% Check that the RenewWhenBelow value make sense.
+      RenewWhenBelow =:= never orelse
+      is_integer(RenewWhenBelow) andalso
+      RenewWhenBelow > 0 andalso
+      RenewWhenBelow =< IncomingWindow ->
+    gen_statem:cast(Session, {flow_session, IncomingWindow, RenewWhenBelow}).
+
+-spec flow_link(pid(), link_handle(), #'v1_0.flow'{}, never | pos_integer()) -> ok.
+flow_link(Session, Handle, Flow, RenewWhenBelow) ->
     gen_statem:cast(Session, {flow_link, Handle, Flow, RenewWhenBelow}).
 
 %% Sending a disposition on a sender link (with receiver-settle-mode = second)
@@ -239,6 +261,9 @@ init([FromPid, Channel, Reader, ConnConfig]) ->
                    channel = Channel,
                    reader = Reader,
                    connection_config = ConnConfig,
+                   incoming_window = ?DEFAULT_MAX_INCOMING_WINDOW,
+                   auto_flow = {?DEFAULT_MAX_INCOMING_WINDOW div 2,
+                                ?DEFAULT_MAX_INCOMING_WINDOW},
                    early_attach_requests = []},
     {ok, unmapped, State}.
 
@@ -282,15 +307,15 @@ mapped(cast, 'end', State) ->
 mapped(cast, {flow_link, OutHandle, Flow0, RenewWhenBelow}, State0) ->
     State = send_flow_link(OutHandle, Flow0, RenewWhenBelow, State0),
     {keep_state, State};
-mapped(cast, {flow_session, Flow0 = #'v1_0.flow'{incoming_window = {uint, IncomingWindow}}},
-       #state{next_incoming_id = NII,
-              next_outgoing_id = NOI} = State) ->
-    Flow = Flow0#'v1_0.flow'{
-                   next_incoming_id = maybe_uint(NII),
-                   next_outgoing_id = uint(NOI),
-                   outgoing_window = ?UINT_OUTGOING_WINDOW},
-    ok = send(Flow, State),
-    {keep_state, State#state{incoming_window = IncomingWindow}};
+mapped(cast, {flow_session, IncomingWindow, RenewWhenBelow}, State0) ->
+    AutoFlow = case RenewWhenBelow of
+                   never -> never;
+                   _ -> {RenewWhenBelow, IncomingWindow}
+               end,
+    State = State0#state{incoming_window = IncomingWindow,
+                         auto_flow = AutoFlow},
+    send_flow_session(State),
+    {keep_state, State};
 mapped(cast, #'v1_0.end'{} = End, State) ->
     %% We receive the first end frame, reply and terminate.
     _ = send_end(State),
@@ -656,34 +681,43 @@ is_bare_message_section(_Section) ->
 
 send_flow_link(OutHandle,
                #'v1_0.flow'{link_credit = {uint, Credit}} = Flow0, RenewWhenBelow,
-               #state{links = Links,
-                      next_incoming_id = NII,
-                      next_outgoing_id = NOI,
-                      incoming_window = InWin} = State) ->
+               #state{links = Links} = State) ->
     AutoFlow = case RenewWhenBelow of
                    never -> never;
-                   Limit -> {auto, Limit, Credit}
+                   _ -> {RenewWhenBelow, Credit}
                end,
     #{OutHandle := #link{output_handle = H,
                          role = receiver,
                          delivery_count = DeliveryCount,
                          available = Available} = Link} = Links,
-    Flow = Flow0#'v1_0.flow'{
-                   handle = uint(H),
-                   %% "This value MUST be set if the peer has received the begin
-                   %% frame for the session, and MUST NOT be set if it has not." [2.7.4]
-                   next_incoming_id = maybe_uint(NII),
-                   next_outgoing_id = uint(NOI),
-                   outgoing_window = ?UINT_OUTGOING_WINDOW,
-                   incoming_window = uint(InWin),
-                   %% "In the event that the receiving link endpoint has not yet seen the
-                   %% initial attach frame from the sender this field MUST NOT be set." [2.7.4]
-                   delivery_count = maybe_uint(DeliveryCount),
-                   available = uint(Available)},
+    Flow1 = Flow0#'v1_0.flow'{
+                    handle = uint(H),
+                    %% "In the event that the receiving link endpoint has not yet seen the
+                    %% initial attach frame from the sender this field MUST NOT be set." [2.7.4]
+                    delivery_count = maybe_uint(DeliveryCount),
+                    available = uint(Available)},
+    Flow = set_flow_session_fields(Flow1, State),
     ok = send(Flow, State),
     State#state{links = Links#{OutHandle =>
                                Link#link{link_credit = Credit,
                                          auto_flow = AutoFlow}}}.
+
+send_flow_session(State) ->
+    Flow = set_flow_session_fields(#'v1_0.flow'{}, State),
+    ok = send(Flow, State).
+
+set_flow_session_fields(Flow, #state{next_incoming_id = NID,
+                                     incoming_window = IW,
+                                     next_outgoing_id = NOI}) ->
+    Flow#'v1_0.flow'{
+           %% "This value MUST be set if the peer has received the begin
+           %% frame for the session, and MUST NOT be set if it has not." [2.7.4]
+           next_incoming_id = maybe_uint(NID),
+           %% IncomingWindow0 can be negative when the sending server overshoots our window.
+           %% We must set a floor of 0 in the FLOW frame because field incoming-window is an uint.
+           incoming_window = uint(max(0, IW)),
+           next_outgoing_id = uint(NOI),
+           outgoing_window = ?UINT_OUTGOING_WINDOW}.
 
 build_frames(Channel, Trf, Bin, MaxPayloadSize, Acc)
   when byte_size(Bin) =< MaxPayloadSize ->
@@ -698,23 +732,39 @@ build_frames(Channel, Trf, Payload, MaxPayloadSize, Acc) ->
 
 make_source(#{role := {sender, _}}) ->
     #'v1_0.source'{};
-make_source(#{role := {receiver, #{address := Address} = Source, _Pid}, filter := Filter}) ->
+make_source(#{role := {receiver, Source, _Pid},
+              filter := Filter}) ->
     Durable = translate_terminus_durability(maps:get(durable, Source, none)),
+    Dynamic = maps:get(dynamic, Source, false),
     TranslatedFilter = translate_filters(Filter),
-    #'v1_0.source'{address = {utf8, Address},
+    #'v1_0.source'{address = make_address(Source),
                    durable = {uint, Durable},
-                   filter = TranslatedFilter}.
+                   dynamic = Dynamic,
+                   filter = TranslatedFilter,
+                   capabilities = make_capabilities(Source)}.
 
 make_target(#{role := {receiver, _Source, _Pid}}) ->
     #'v1_0.target'{};
-make_target(#{role := {sender, #{address := Address} = Target}}) ->
+make_target(#{role := {sender, Target}}) ->
     Durable = translate_terminus_durability(maps:get(durable, Target, none)),
-    TargetAddr = case is_binary(Address) of
-                     true -> {utf8, Address};
-                     false -> Address
-                 end,
-    #'v1_0.target'{address = TargetAddr,
-                   durable = {uint, Durable}}.
+    Dynamic = maps:get(dynamic, Target, false),
+    #'v1_0.target'{address = make_address(Target),
+                   durable = {uint, Durable},
+                   dynamic = Dynamic,
+                   capabilities = make_capabilities(Target)}.
+
+make_address(#{address := Addr}) ->
+    if is_binary(Addr) ->
+           {utf8, Addr};
+       is_atom(Addr) ->
+           Addr
+    end.
+
+make_capabilities(#{capabilities := Caps0}) ->
+    Caps = [{symbol, C} || C <- Caps0],
+    {array, symbol, Caps};
+make_capabilities(_) ->
+    undefined.
 
 max_message_size(#{max_message_size := Size})
   when is_integer(Size) andalso
@@ -1043,17 +1093,21 @@ book_transfer_send(Num, #link{output_handle = Handle} = Link,
                 links = Links#{Handle => book_link_transfer_send(Link)}}.
 
 book_partial_transfer_received(#state{next_incoming_id = NID,
-                                      remote_outgoing_window = ROW} = State) ->
-    State#state{next_incoming_id = add(NID, 1),
-                remote_outgoing_window = ROW - 1}.
+                                      incoming_window = IW,
+                                      remote_outgoing_window = ROW} = State0) ->
+    State = State0#state{next_incoming_id = add(NID, 1),
+                         incoming_window = IW - 1,
+                         remote_outgoing_window = ROW - 1},
+    maybe_widen_incoming_window(State).
 
 book_transfer_received(State = #state{connection_config =
                                       #{transfer_limit_margin := Margin}},
                        #link{link_credit = Margin} = Link) ->
     {transfer_limit_exceeded, Link, State};
 book_transfer_received(#state{next_incoming_id = NID,
+                              incoming_window = IW,
                               remote_outgoing_window = ROW,
-                              links = Links} = State,
+                              links = Links} = State0,
                        #link{output_handle = OutHandle,
                              delivery_count = DC,
                              link_credit = LC,
@@ -1063,19 +1117,31 @@ book_transfer_received(#state{next_incoming_id = NID,
                       %% "the receiver MUST maintain a floor of zero in its
                       %% calculation of the value of available" [2.6.7]
                       available = max(0, Avail - 1)},
-    State1 = State#state{links = Links#{OutHandle => Link1},
-                         next_incoming_id = add(NID, 1),
-                         remote_outgoing_window = ROW - 1},
+    State1 = State0#state{links = Links#{OutHandle => Link1},
+                          next_incoming_id = add(NID, 1),
+                          incoming_window = IW - 1,
+                          remote_outgoing_window = ROW - 1},
+    State = maybe_widen_incoming_window(State1),
     case Link1 of
         #link{link_credit = 0,
               auto_flow = never} ->
-            {credit_exhausted, Link1, State1};
+            {credit_exhausted, Link1, State};
         _ ->
-            {ok, Link1, State1}
+            {ok, Link1, State}
     end.
 
+maybe_widen_incoming_window(
+  State0 = #state{incoming_window = IncomingWindow,
+                  auto_flow = {RenewWhenBelow, NewWindowSize}})
+  when IncomingWindow < RenewWhenBelow ->
+    State = State0#state{incoming_window = NewWindowSize},
+    send_flow_session(State),
+    State;
+maybe_widen_incoming_window(State) ->
+    State.
+
 auto_flow(#link{link_credit = LC,
-                auto_flow = {auto, RenewWhenBelow, Credit},
+                auto_flow = {RenewWhenBelow, Credit},
                 output_handle = OutHandle,
                 incoming_unsettled = Unsettled},
           State)
@@ -1214,6 +1280,7 @@ format_status(Status = #{data := Data0}) ->
            remote_channel = RemoteChannel,
            next_incoming_id = NextIncomingId,
            incoming_window = IncomingWindow,
+           auto_flow = SessionAutoFlow,
            next_outgoing_id = NextOutgoingId,
            remote_incoming_window = RemoteIncomingWindow,
            remote_outgoing_window = RemoteOutgoingWindow,
@@ -1278,6 +1345,7 @@ format_status(Status = #{data := Data0}) ->
              remote_channel => RemoteChannel,
              next_incoming_id => NextIncomingId,
              incoming_window => IncomingWindow,
+             auto_flow => SessionAutoFlow,
              next_outgoing_id => NextOutgoingId,
              remote_incoming_window => RemoteIncomingWindow,
              remote_outgoing_window => RemoteOutgoingWindow,

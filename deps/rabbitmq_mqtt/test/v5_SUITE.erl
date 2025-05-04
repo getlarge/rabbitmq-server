@@ -206,9 +206,26 @@ end_per_testcase(T, Config) ->
     end_per_testcase0(T, Config).
 
 end_per_testcase0(Testcase, Config) ->
+    %% Terminate all connections and wait for sessions to terminate before
+    %% starting the next test case.
+    _ = rabbit_ct_broker_helpers:rpc(
+          Config, 0,
+          rabbit_networking, close_all_connections, [<<"test finished">>]),
+    _ = rabbit_ct_broker_helpers:rpc_all(
+          Config,
+          rabbit_mqtt, close_local_client_connections, [normal]),
+    eventually(?_assertEqual(
+                  [],
+                  rpc(Config, rabbit_mqtt, local_connection_pids, []))),
     %% Assert that every testcase cleaned up their MQTT sessions.
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_queues, []),
     eventually(?_assertEqual([], rpc(Config, rabbit_amqqueue, list, []))),
     rabbit_ct_helpers:testcase_finished(Config, Testcase).
+
+delete_queues() ->
+    _ = [catch rabbit_amqqueue:delete(Q, false, false, <<"test finished">>)
+         || Q <- rabbit_amqqueue:list()],
+    ok.
 
 %% -------------------------------------------------------------------
 %% Testsuite cases
@@ -1020,17 +1037,27 @@ session_upgrade_v3_v5_qos0(Config) ->
 session_upgrade_v3_v5_qos(Qos, Config) ->
     ClientId = Topic = atom_to_binary(?FUNCTION_NAME),
     Pub = connect(<<"publisher">>, Config),
-    Subv3 = connect(ClientId, Config, [{proto_ver, v3} | non_clean_sess_opts()]),
+    Subv3 = connect(ClientId, Config,
+                    [{proto_ver, v3},
+                     {auto_ack, false}] ++
+                    non_clean_sess_opts()),
     ?assertEqual(3, proplists:get_value(proto_ver, emqtt:info(Subv3))),
     {ok, _, [Qos]} = emqtt:subscribe(Subv3, Topic, Qos),
     Sender = spawn_link(?MODULE, send, [self(), Pub, Topic, 0]),
     receive {publish, #{payload := <<"1">>,
-                        client_pid := Subv3}} -> ok
+                        client_pid := Subv3,
+                        packet_id := PacketId}} ->
+                case Qos of
+                    0 -> ok;
+                    1 -> emqtt:puback(Subv3, PacketId)
+                end
     after ?TIMEOUT -> ct:fail("did not receive 1")
     end,
     %% Upgrade session from v3 to v5 while another client is sending messages.
     ok = emqtt:disconnect(Subv3),
-    Subv5 = connect(ClientId, Config, [{proto_ver, v5}, {clean_start, false}]),
+    Subv5 = connect(ClientId, Config, [{proto_ver, v5},
+                                       {clean_start, false},
+                                       {auto_ack, true}]),
     ?assertEqual(5, proplists:get_value(proto_ver, emqtt:info(Subv5))),
     Sender ! stop,
     NumSent = receive {N, Sender} -> N
@@ -1665,7 +1692,8 @@ will_delay_node_restart(Config) ->
     {ok, _, [0]} = emqtt:subscribe(Sub0a, Topic),
     Sub1 = connect(<<"sub1">>, Config, 1, []),
     {ok, _, [0]} = emqtt:subscribe(Sub1, Topic),
-    WillDelaySecs = 10,
+    %% In mixed version mode with Khepri, draining the node can take 30 seconds.
+    WillDelaySecs = 40,
     C0a = connect(<<"will">>, Config, 0,
                   [{properties, #{'Session-Expiry-Interval' => 900}},
                    {will_props, #{'Will-Delay-Interval' => WillDelaySecs}},

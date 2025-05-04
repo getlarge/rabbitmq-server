@@ -35,7 +35,7 @@
 
     control_action/2, control_action/3, control_action/4,
     rabbitmqctl/3, rabbitmqctl/4, rabbitmqctl_list/3,
-    rabbitmq_queues/3,
+    rabbitmq_queues/3, rabbitmq_diagnostics/3,
 
     add_code_path_to_node/2,
     add_code_path_to_all_nodes/2,
@@ -55,7 +55,6 @@
     kill_node_after/3,
 
     reset_node/2,
-    force_reset_node/2,
 
     forget_cluster_node/3,
     forget_cluster_node/4,
@@ -174,7 +173,8 @@
     user/1,
 
     configured_metadata_store/1,
-    await_metadata_store_consistent/2
+    await_metadata_store_consistent/2,
+    do_nodes_run_same_ra_machine_version/2
   ]).
 
 %% Internal functions exported to be used by rpc:call/4.
@@ -219,6 +219,7 @@ setup_steps() ->
                 fun rabbit_ct_helpers:ensure_rabbitmqctl_cmd/1,
                 fun rabbit_ct_helpers:ensure_rabbitmqctl_app/1,
                 fun rabbit_ct_helpers:ensure_rabbitmq_plugins_cmd/1,
+                fun rabbit_ct_helpers:ensure_rabbitmq_diagnostics_cmd/1,
                 fun set_lager_flood_limit/1,
                 fun configure_metadata_store/1,
                 fun start_rabbitmq_nodes/1,
@@ -229,6 +230,7 @@ setup_steps() ->
                 fun rabbit_ct_helpers:ensure_rabbitmqctl_cmd/1,
                 fun rabbit_ct_helpers:load_rabbitmqctl_app/1,
                 fun rabbit_ct_helpers:ensure_rabbitmq_plugins_cmd/1,
+                fun rabbit_ct_helpers:ensure_rabbitmq_diagnostics_cmd/1,
                 fun set_lager_flood_limit/1,
                 fun configure_metadata_store/1,
                 fun start_rabbitmq_nodes/1,
@@ -979,12 +981,17 @@ cluster_nodes(Config, Nodes) when is_list(Nodes) ->
               [Nodename]),
             cluster_nodes1(Config, SecNodeConfig, NodeConfigs1);
         false ->
-            [NodeConfig | NodeConfigs1] = NodeConfigs,
-            Nodename = ?config(nodename, NodeConfig),
-            ct:pal(
-              "Using node ~s as the cluster seed node",
-              [Nodename]),
-            cluster_nodes1(Config, NodeConfig, NodeConfigs1)
+            case NodeConfigs of
+                [NodeConfig, SeedNodeConfig | NodeConfigs1] ->
+                    Nodename = ?config(nodename, SeedNodeConfig),
+                    ct:pal(
+                      "Using node ~s as the cluster seed node",
+                      [Nodename]),
+                    cluster_nodes1(
+                      Config, SeedNodeConfig, [NodeConfig | NodeConfigs1]);
+                [_] ->
+                    Config
+            end
     end;
 cluster_nodes(Config, SeedNode) ->
     Nodenames = get_node_configs(Config, nodename),
@@ -1174,6 +1181,12 @@ await_metadata_store_consistent(Config, Node) ->
 ra_last_applied(ServerId) ->
     #{last_applied := LastApplied} = ra:key_metrics(ServerId),
     LastApplied.
+
+do_nodes_run_same_ra_machine_version(Config, RaMachineMod) ->
+    [MacVer1 | MacVerN] = MacVers = rpc_all(Config, RaMachineMod, version, []),
+    ct:pal("Ra machine versions of ~s: ~0p", [RaMachineMod, MacVers]),
+    is_integer(MacVer1) andalso
+    lists:all(fun(MacVer) -> MacVer =:= MacVer1 end, MacVerN).
 
 rewrite_node_config_file(Config, Node) ->
     NodeConfig = get_node_config(Config, Node),
@@ -1557,6 +1570,21 @@ rabbitmq_queues(Config, Node, Args) ->
                   [{"RABBITMQ_FEATURE_FLAGS_FILE", EnabledFeatureFlagsFile}]
           end,
     Cmd = [RabbitmqQueues, "-n", Nodename | Args],
+    rabbit_ct_helpers:exec(Cmd, [{env, Env}]).
+
+rabbitmq_diagnostics(Config, Node, Args) ->
+    Rabbitmqdiagnostics = ?config(rabbitmq_diagnostics_cmd, Config),
+    NodeConfig = get_node_config(Config, Node),
+    Nodename = ?config(nodename, NodeConfig),
+    Env = [
+      {"RABBITMQ_SCRIPTS_DIR", filename:dirname(Rabbitmqdiagnostics)},
+      {"RABBITMQ_PID_FILE", ?config(pid_file, NodeConfig)},
+      {"RABBITMQ_MNESIA_DIR", ?config(data_dir, NodeConfig)},
+      {"RABBITMQ_PLUGINS_DIR", ?config(plugins_dir, NodeConfig)},
+      {"RABBITMQ_ENABLED_PLUGINS_FILE",
+        ?config(enabled_plugins_file, NodeConfig)}
+    ],
+    Cmd = [Rabbitmqdiagnostics, "-n", Nodename | Args],
     rabbit_ct_helpers:exec(Cmd, [{env, Env}]).
 
 %% -------------------------------------------------------------------
@@ -2158,10 +2186,6 @@ await_os_pid_death(Pid) ->
 reset_node(Config, Node) ->
     Name = get_node_config(Config, Node, nodename),
     rabbit_control_helper:command(reset, Name).
-
-force_reset_node(Config, Node) ->
-    Name = get_node_config(Config, Node, nodename),
-    rabbit_control_helper:command(force_reset, Name).
 
 forget_cluster_node(Config, Node, NodeToForget) ->
     forget_cluster_node(Config, Node, NodeToForget, []).

@@ -3,15 +3,17 @@ const XMLHttpRequest = require('xmlhttprequest').XMLHttpRequest
 const fsp = fs.promises
 const path = require('path')
 const { By, Key, until, Builder, logging, Capabilities } = require('selenium-webdriver')
+const proxy = require('selenium-webdriver/proxy')
 require('chromedriver')
+var chrome = require("selenium-webdriver/chrome");
 const UAALoginPage = require('./pageobjects/UAALoginPage')
 const KeycloakLoginPage = require('./pageobjects/KeycloakLoginPage')
 const assert = require('assert')
 
+const runLocal = String(process.env.RUN_LOCAL).toLowerCase() != 'false'
 const uaaUrl = process.env.UAA_URL || 'http://localhost:8080'
 const baseUrl = randomly_pick_baseurl(process.env.RABBITMQ_URL) || 'http://localhost:15672/'
 const hostname = process.env.RABBITMQ_HOSTNAME || 'localhost'
-const runLocal = String(process.env.RUN_LOCAL).toLowerCase() != 'false'
 const seleniumUrl = process.env.SELENIUM_URL || 'http://selenium:4444'
 const screenshotsDir = process.env.SCREENSHOTS_DIR || '/screens'
 const profiles = process.env.PROFILES || ''
@@ -46,7 +48,9 @@ module.exports = {
   log: (message) => {
     console.log(new Date() + " " + message)
   },
-
+  error: (message) => {
+    console.error(new Date() + " " + message)
+  },
   hasProfile: (profile) => {
     return profiles.includes(profile)
   },
@@ -57,15 +61,34 @@ module.exports = {
       builder = builder.usingServer(seleniumUrl)
     }
     let chromeCapabilities = Capabilities.chrome();
-    chromeCapabilities.setAcceptInsecureCerts(true);
+    const options = new chrome.Options()
+    chromeCapabilities.setAcceptInsecureCerts(true);  
     chromeCapabilities.set('goog:chromeOptions', {
+      excludeSwitches: [ // disable info bar
+        'enable-automation',
+      ],
+      prefs: {
+        'profile.password_manager_enabled' : false      
+      },
       args: [
+          "--enable-automation",
+          "guest",
+          "disable-infobars",
+          "--disable-notifications",
           "--lang=en",
-          "--disable-search-engine-choice-screen"
+          "--disable-search-engine-choice-screen",
+          "disable-popup-blocking",
+          "--credentials_enable_service=false",
+          "profile.password_manager_enabled=false",
+          "profile.reduce-security-for-testing",
+          "profile.managed_default_content_settings.popups=1",
+          "profile.managed_default_content_settings.notifications.popups=1",
+          "profile.password_manager_leak_detection=false"
       ]
     });
     driver = builder
       .forBrowser('chrome')
+      //.setChromeOptions(options.excludeSwitches("disable-popup-blocking", "enable-automation"))
       .withCapabilities(chromeCapabilities)
       .build()
     driver.manage().setTimeouts( { pageLoad: 35000 } )
@@ -104,6 +127,34 @@ module.exports = {
 
   captureScreensFor: (driver, test) => {
     return new CaptureScreenshot(driver, require('path').basename(test))
+  },
+
+  doWhile: async (doCallback, booleanCallback, delayMs = 1000, message = "doWhile failed") => {
+    let done = false 
+    let attempts = 10
+    let ret
+    do {
+      try {
+        //console.log("Calling doCallback (attempts:" + attempts + ") ... ")
+        ret = await doCallback()
+        //console.log("Calling booleanCallback (attempts:" + attempts + ") with arg " + ret + " ... ")
+        done =  booleanCallback(ret)
+      }catch(error) {
+        console.log("Caught " + error + " on doWhile callback...")
+        
+      }finally {
+        if (!done) {
+          //console.log("Waiting until next attempt")
+          await module.exports.delay(delayMs)
+        }
+      }     
+      attempts--
+    } while (attempts > 0 && !done)
+    if (!done) {
+      throw new Error(message)
+    }else {
+      return ret
+    }
   },
 
   idpLoginPage: (driver, preferredIdp) => {

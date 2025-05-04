@@ -65,6 +65,13 @@
                     {requires,    pre_boot},
                     {enables,     external_infrastructure}]}).
 
+-rabbit_boot_step({rabbit_registry,
+                   [{description, "plugin registry"},
+                    {mfa,         {rabbit_sup, start_child,
+                                   [rabbit_registry]}},
+                    {requires,    pre_boot},
+                    {enables,     database}]}).
+
 -rabbit_boot_step({database,
                    [{mfa,         {rabbit_db, init, []}},
                     {requires,    file_handle_cache},
@@ -109,13 +116,6 @@
 
 -rabbit_boot_step({external_infrastructure,
                    [{description, "external infrastructure ready"}]}).
-
--rabbit_boot_step({rabbit_registry,
-                   [{description, "plugin registry"},
-                    {mfa,         {rabbit_sup, start_child,
-                                   [rabbit_registry]}},
-                    {requires,    external_infrastructure},
-                    {enables,     kernel_ready}]}).
 
 -rabbit_boot_step({rabbit_core_metrics,
                    [{description, "core metrics storage"},
@@ -1655,9 +1655,11 @@ persist_static_configuration() ->
     persist_static_configuration(
       [classic_queue_index_v2_segment_entry_count,
        classic_queue_store_v2_max_cache_size,
-       classic_queue_store_v2_check_crc32,
-       incoming_message_interceptors
+       classic_queue_store_v2_check_crc32
       ]),
+
+    Interceptors = application:get_env(?MODULE, message_interceptors, []),
+    ok = rabbit_msg_interceptor:add(Interceptors),
 
     %% Disallow the following two cases:
     %% 1. Negative values

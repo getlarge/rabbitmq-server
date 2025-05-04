@@ -21,6 +21,7 @@
          get_all/0,
          get_all/1,
          get_all_by_type/1,
+         get_all_by_type_and_vhost/2,
          get_all_by_type_and_node/3,
          list/0,
          count/0,
@@ -410,8 +411,18 @@ delete_in_khepri(QueueName, OnlyDurable) ->
     rabbit_khepri:transaction(
       fun () ->
               Path = khepri_queue_path(QueueName),
+              UsesUniformWriteRet = try
+                                        khepri_tx:does_api_comply_with(uniform_write_ret)
+                                    catch
+                                        error:undef ->
+                                            false
+                                    end,
               case khepri_tx_adv:delete(Path) of
-                  {ok, #{data := _}} ->
+                  {ok, #{Path := #{data := _}}} when UsesUniformWriteRet ->
+                      %% we want to execute some things, as decided by rabbit_exchange,
+                      %% after the transaction.
+                      rabbit_db_binding:delete_for_destination_in_khepri(QueueName, OnlyDurable);
+                  {ok, #{data := _}} when not UsesUniformWriteRet ->
                       %% we want to execute some things, as decided by rabbit_exchange,
                       %% after the transaction.
                       rabbit_db_binding:delete_for_destination_in_khepri(QueueName, OnlyDurable);
@@ -606,7 +617,7 @@ update_in_khepri(QName, Fun) ->
     Path = khepri_queue_path(QName),
     Ret1 = rabbit_khepri:adv_get(Path),
     case Ret1 of
-        {ok, #{data := Q, payload_version := Vsn}} ->
+        {ok, #{Path := #{data := Q, payload_version := Vsn}}} ->
             UpdatePath = khepri_path:combine_with_conditions(
                            Path, [#if_payload_version{version = Vsn}]),
             Q1 = Fun(Q),
@@ -657,7 +668,7 @@ update_decorators_in_khepri(QName, Decorators) ->
     Path = khepri_queue_path(QName),
     Ret1 = rabbit_khepri:adv_get(Path),
     case Ret1 of
-        {ok, #{data := Q1, payload_version := Vsn}} ->
+        {ok, #{Path := #{data := Q1, payload_version := Vsn}}} ->
             Q2 = amqqueue:set_decorators(Q1, Decorators),
             UpdatePath = khepri_path:combine_with_conditions(
                            Path, [#if_payload_version{version = Vsn}]),
@@ -824,6 +835,28 @@ consistent_exists_in_mnesia(QName) ->
 
 get_all_by_type(Type) ->
     Pattern = amqqueue:pattern_match_on_type(Type),
+    rabbit_khepri:handle_fallback(
+      #{mnesia => fun() -> get_all_by_pattern_in_mnesia(Pattern) end,
+        khepri => fun() -> get_all_by_pattern_in_khepri(Pattern) end
+       }).
+
+%% -------------------------------------------------------------------
+%% get_all_by_type_and_vhost().
+%% -------------------------------------------------------------------
+
+-spec get_all_by_type_and_vhost(Type, VHost) -> [Queue] when
+      Type :: atom(),
+      VHost :: binary(),
+      Queue :: amqqueue:amqqueue().
+
+%% @doc Gets all queues belonging to the given type and vhost
+%%
+%% @returns a list of queue records.
+%%
+%% @private
+
+get_all_by_type_and_vhost(Type, VHost) ->
+    Pattern = amqqueue:pattern_match_on_type_and_vhost(Type, VHost),
     rabbit_khepri:handle_fallback(
       #{mnesia => fun() -> get_all_by_pattern_in_mnesia(Pattern) end,
         khepri => fun() -> get_all_by_pattern_in_khepri(Pattern) end
@@ -1075,15 +1108,12 @@ delete_transient_in_khepri(FilterFun) ->
     case rabbit_khepri:adv_get_many(PathPattern) of
         {ok, Props} ->
             Qs = maps:fold(
-                   fun(Path0, #{data := Q, payload_version := Vsn}, Acc)
+                   fun(Path, #{data := Q, payload_version := Vsn}, Acc)
                        when ?is_amqqueue(Q) ->
                            case FilterFun(Q) of
                                true ->
-                                   Path = khepri_path:combine_with_conditions(
-                                            Path0,
-                                            [#if_payload_version{version = Vsn}]),
                                    QName = amqqueue:get_name(Q),
-                                   [{Path, QName} | Acc];
+                                   [{Path, Vsn, QName} | Acc];
                                false ->
                                    Acc
                            end
@@ -1102,20 +1132,7 @@ do_delete_transient_queues_in_khepri([], _FilterFun) ->
 do_delete_transient_queues_in_khepri(Qs, FilterFun) ->
     Res = rabbit_khepri:transaction(
             fun() ->
-                    rabbit_misc:fold_while_ok(
-                      fun({Path, QName}, Acc) ->
-                              %% Also see `delete_in_khepri/2'.
-                              case khepri_tx_adv:delete(Path) of
-                                  {ok, #{data := _}} ->
-                                      Deletions = rabbit_db_binding:delete_for_destination_in_khepri(
-                                                    QName, false),
-                                      {ok, [{QName, Deletions} | Acc]};
-                                  {ok, _} ->
-                                      {ok, Acc};
-                                  {error, _} = Error ->
-                                      Error
-                              end
-                      end, [], Qs)
+                    do_delete_transient_queues_in_khepri_tx(Qs, [])
             end),
     case Res of
         {ok, Items} ->
@@ -1125,6 +1142,35 @@ do_delete_transient_queues_in_khepri(Qs, FilterFun) ->
             %% One of the queues changed while attempting to update all
             %% queues. Retry the operation.
             delete_transient_in_khepri(FilterFun);
+        {error, _} = Error ->
+            Error
+    end.
+
+do_delete_transient_queues_in_khepri_tx([], Acc) ->
+    {ok, Acc};
+do_delete_transient_queues_in_khepri_tx([{Path, Vsn, QName} | Rest], Acc) ->
+    %% Also see `delete_in_khepri/2'.
+    VersionedPath = khepri_path:combine_with_conditions(
+                      Path, [#if_payload_version{version = Vsn}]),
+    UsesUniformWriteRet = try
+                              khepri_tx:does_api_comply_with(uniform_write_ret)
+                          catch
+                              error:undef ->
+                                  false
+                          end,
+    case khepri_tx_adv:delete(VersionedPath) of
+        {ok, #{Path := #{data := _}}} when UsesUniformWriteRet ->
+            Deletions = rabbit_db_binding:delete_for_destination_in_khepri(
+                          QName, false),
+            Acc1 = [{QName, Deletions} | Acc],
+            do_delete_transient_queues_in_khepri_tx(Rest, Acc1);
+        {ok, #{data := _}} when not UsesUniformWriteRet ->
+            Deletions = rabbit_db_binding:delete_for_destination_in_khepri(
+                          QName, false),
+            Acc1 = [{QName, Deletions} | Acc],
+            do_delete_transient_queues_in_khepri_tx(Rest, Acc1);
+        {ok, _} ->
+            do_delete_transient_queues_in_khepri_tx(Rest, Acc);
         {error, _} = Error ->
             Error
     end.

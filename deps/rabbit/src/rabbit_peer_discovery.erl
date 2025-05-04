@@ -22,6 +22,7 @@
          maybe_unregister/0,
          discover_cluster_nodes/0]).
 -export([backend/0,
+         should_perform_registration/0,
          node_type/0,
          normalize/1,
          append_node_prefix/1,
@@ -45,6 +46,9 @@
 %% what node type is used by default for this node when joining
 %% a new cluster as a virgin node
 -define(DEFAULT_NODE_TYPE, disc).
+
+%% Register node by default (with the backends that support registration)
+-define(PERFORM_REGISTRATION_BY_DEFAULT, true).
 
 %% default node prefix to attach to discovered hostnames
 -define(DEFAULT_PREFIX, "rabbit").
@@ -82,6 +86,16 @@ node_type() ->
             ?DEFAULT_NODE_TYPE
     end.
 
+-spec should_perform_registration() -> true | false.
+
+should_perform_registration() ->
+    case application:get_env(rabbit, cluster_formation) of
+        {ok, Proplist} ->
+            proplists:get_value(perform_registration, Proplist, ?PERFORM_REGISTRATION_BY_DEFAULT);
+        undefined ->
+            ?PERFORM_REGISTRATION_BY_DEFAULT
+    end.
+
 -spec lock_acquisition_failure_mode() -> ignore | fail.
 
 lock_acquisition_failure_mode() ->
@@ -108,28 +122,30 @@ maybe_init() ->
     %% node, even if the configuration changed in between.
     persistent_term:put(?PT_PEER_DISC_BACKEND, Backend),
 
-    _ = code:ensure_loaded(Backend),
-    case erlang:function_exported(Backend, init, 0) of
-        true  ->
-            ?LOG_DEBUG(
-               "Peer discovery: backend supports initialisation",
-               #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
-            case Backend:init() of
-                ok ->
-                    ?LOG_DEBUG(
-                       "Peer discovery: backend initialisation succeeded",
-                       #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
-                    ok;
-                {error, _Reason} = Error ->
-                    ?LOG_WARNING(
-                       "Peer discovery: backend initialisation failed: ~tp.",
-                       [Error],
-                       #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
-                    ok
-            end;
-        false ->
+    try
+        case Backend:init() of
+            ok ->
+                ?LOG_DEBUG(
+                   "Peer discovery: backend initialisation succeeded",
+                   #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+                ok;
+            {error, _Reason} = Error ->
+                ?LOG_WARNING(
+                   "Peer discovery: backend initialisation failed: ~tp.",
+                   [Error],
+                   #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+                ok
+        end
+    catch
+        error:undef ->
             ?LOG_DEBUG(
                "Peer discovery: backend does not support initialisation",
+               #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+            ok;
+        _:Reason:Stacktrace ->
+            ?LOG_ERROR(
+               "Peer discovery: backend initialisation failed: ~tp, ~tp",
+               [Reason, Stacktrace],
                #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
             ok
     end.
@@ -153,13 +169,13 @@ sync_desired_cluster() ->
 
     %% We handle retries at the top level: steps are followed sequentially and
     %% if one of them fails, we retry the whole process.
-    {Retries, RetryDelay} = discovery_retries(),
+    {Retries, RetryDelay} = discovery_retries(Backend),
 
     sync_desired_cluster(Backend, Retries, RetryDelay).
 
 -spec sync_desired_cluster(Backend, RetriesLeft, RetryDelay) -> ok when
       Backend :: backend(),
-      RetriesLeft :: non_neg_integer(),
+      RetriesLeft :: non_neg_integer() | unlimited,
       RetryDelay :: non_neg_integer().
 %% @private
 
@@ -240,10 +256,18 @@ sync_desired_cluster(Backend, RetriesLeft, RetryDelay) ->
 
 -spec retry_sync_desired_cluster(Backend, RetriesLeft, RetryDelay) -> ok when
       Backend :: backend(),
-      RetriesLeft :: non_neg_integer(),
+      RetriesLeft :: non_neg_integer() | unlimited,
       RetryDelay :: non_neg_integer().
 %% @private
 
+retry_sync_desired_cluster(Backend, unlimited, RetryDelay) ->
+    ?LOG_DEBUG(
+       "Peer discovery: retrying to create/sync cluster in ~b ms "
+       "(will retry forever)",
+       [RetryDelay],
+       #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+    timer:sleep(RetryDelay),
+    sync_desired_cluster(Backend, unlimited, RetryDelay);
 retry_sync_desired_cluster(Backend, RetriesLeft, RetryDelay)
   when RetriesLeft > 0 ->
     RetriesLeft1 = RetriesLeft - 1,
@@ -613,8 +637,7 @@ query_node_props2([{Node, Members} | Rest], NodesAndProps, FromNode) ->
                            ["Peer discovery: temporary hidden node '~ts' "
                             "queries properties from node '~ts'",
                             [node(), Node]], FromNode),
-                         StartTime = get_node_start_time(
-                                       Node, microsecond, FromNode),
+                         StartTime = get_node_start_time(Node, FromNode),
                          IsReady = is_node_db_ready(Node, FromNode),
                          NodeAndProps = {Node, Members, StartTime, IsReady},
                          NodesAndProps1 = [NodeAndProps | NodesAndProps],
@@ -642,9 +665,8 @@ query_node_props2([], NodesAndProps, _FromNode) ->
     ?assert(length(NodesAndProps1) =< length(nodes(hidden))),
     NodesAndProps1.
 
--spec get_node_start_time(Node, Unit, FromNode) -> StartTime when
+-spec get_node_start_time(Node, FromNode) -> StartTime when
       Node :: node(),
-      Unit :: erlang:time_unit(),
       FromNode :: node(),
       StartTime :: non_neg_integer().
 %% @doc Returns the start time of the given `Node' in `Unit'.
@@ -665,15 +687,21 @@ query_node_props2([], NodesAndProps, _FromNode) ->
 %%
 %% @private
 
-get_node_start_time(Node, Unit, FromNode) ->
-    NativeStartTime = erpc_call(
-                        Node, erlang, system_info, [start_time], FromNode),
-    TimeOffset = erpc_call(Node, erlang, time_offset, [], FromNode),
-    SystemStartTime = NativeStartTime + TimeOffset,
-    StartTime = erpc_call(
-                  Node, erlang, convert_time_unit,
-                  [SystemStartTime, native, Unit], FromNode),
-    StartTime.
+get_node_start_time(Node, FromNode) ->
+    try
+        erpc_call(Node,rabbit_boot_state, get_start_time, [], FromNode)
+    catch
+        error:{exception, _, _} ->
+            NativeStartTime = erpc_call(
+                                Node, erlang, system_info, [start_time],
+                                FromNode),
+            TimeOffset = erpc_call(Node, erlang, time_offset, [], FromNode),
+            SystemStartTime = NativeStartTime + TimeOffset,
+            StartTime = erpc_call(
+                          Node, erlang, convert_time_unit,
+                          [SystemStartTime, native, microsecond], FromNode),
+            StartTime
+    end.
 
 -spec is_node_db_ready(Node, FromNode) -> IsReady when
       Node :: node(),
@@ -835,6 +863,12 @@ can_use_discovered_nodes(_DiscoveredNodes, []) ->
 %%
 %% @private
 
+select_node_to_join([]) ->
+    ?LOG_INFO(
+       "Peer discovery: no nodes available for auto-clustering; waiting before retrying...",
+       [],
+       #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+    false;
 select_node_to_join([{Node, _Members, _StartTime, _IsReady} | _])
   when Node =:= node() ->
     ?LOG_INFO(
@@ -968,18 +1002,26 @@ error_description({invalid_cluster_node_type, BadType}) ->
 -spec maybe_register() -> ok.
 
 maybe_register() ->
-    Backend = persistent_term:get(?PT_PEER_DISC_BACKEND, backend()),
-    case Backend:supports_registration() of
+    case should_perform_registration() of
         true ->
-            ?LOG_DEBUG(
-               "Peer discovery: registering this node",
-               #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
-            register(Backend),
-            _ = Backend:post_registration(),
-            ok;
+            Backend = persistent_term:get(?PT_PEER_DISC_BACKEND, backend()),
+            case Backend:supports_registration() of
+                true ->
+                    ?LOG_DEBUG(
+                       "Peer discovery: registering this node",
+                       #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+                    register(Backend),
+                    _ = Backend:post_registration(),
+                    ok;
+                false ->
+                    ?LOG_DEBUG(
+                       "Peer discovery: registration is not supported, skipping it",
+                       #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+                    ok
+            end;
         false ->
             ?LOG_DEBUG(
-               "Peer discovery: registration unsupported, skipping register",
+               "Peer discovery: registration is disabled via configuration, skipping it",
                #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
             ok
     end.
@@ -987,25 +1029,46 @@ maybe_register() ->
 -spec maybe_unregister() -> ok.
 
 maybe_unregister() ->
-    Backend = persistent_term:get(?PT_PEER_DISC_BACKEND),
-    case Backend:supports_registration() of
+    case should_perform_registration() of
         true ->
-            ?LOG_DEBUG(
-               "Peer discovery: unregistering this node",
-               #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
-            unregister(Backend);
+            Backend = persistent_term:get(?PT_PEER_DISC_BACKEND),
+            case Backend:supports_registration() of
+                true ->
+                    ?LOG_DEBUG(
+                       "Peer discovery: unregistering this node",
+                       #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+                    unregister(Backend);
+                false ->
+                    ?LOG_DEBUG(
+                       "Peer discovery: registration is not supported, skipping unregistration",
+                       #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
+                    ok
+            end;
         false ->
             ?LOG_DEBUG(
-               "Peer discovery: registration unsupported, skipping unregister",
+               "Peer discovery: registration is disabled via configuration, skipping unregistration",
                #{domain => ?RMQLOG_DOMAIN_PEER_DISC}),
             ok
     end.
 
--spec discovery_retries() -> {Retries, RetryDelay} when
-      Retries :: non_neg_integer(),
+-spec discovery_retries(Backend) -> {Retries, RetryDelay} when
+      Backend :: backend(),
+      Retries :: non_neg_integer() | unlimited,
       RetryDelay :: non_neg_integer().
 
-discovery_retries() ->
+discovery_retries(Backend) ->
+    {_Retries, RetryDelay} = RetryConfig = discovery_retries_from_config(),
+    case catch Backend:retry_strategy() of
+        unlimited ->
+            {unlimited, RetryDelay};
+        _ ->
+            RetryConfig
+    end.
+
+-spec discovery_retries_from_config() -> {Retries, RetryDelay} when
+      Retries :: non_neg_integer(),
+      RetryDelay :: non_neg_integer().
+discovery_retries_from_config() ->
     case application:get_env(rabbit, cluster_formation) of
         {ok, Proplist} ->
             Retries  = proplists:get_value(discovery_retry_limit,    Proplist, ?DEFAULT_DISCOVERY_RETRY_COUNT),

@@ -74,18 +74,11 @@ function dispatcher_add(fun) {
 }
 
 function dispatcher() {
+    this.use('Title');
+    this.setTitle('RabbitMQ: ');
     for (var i in dispatcher_modules) {
         dispatcher_modules[i](this);
     }
-}
-
-function getParameterByName(name) {
-    var match = RegExp('[#&]' + name + '=([^&]*)').exec(window.location.hash);
-    return match && decodeURIComponent(match[1].replace(/\+/g, ' '));
-}
-
-function getAccessToken() {
-    return getParameterByName('access_token');
 }
 
 function start_app_login () {
@@ -1766,40 +1759,20 @@ function select_queue_type(queuetype) {
     update();
 }
 
+function get_queue_type (queue) {    
+    return queue.type;
+}
+
 function is_quorum(queue) {
-    if (queue["arguments"]) {
-        if (queue["arguments"]["x-queue-type"]) {
-            return queue["arguments"]["x-queue-type"] === "quorum";
-        } else {
-            return false;
-        }
-    } else {
-        return false;
-    }
+    return get_queue_type(queue) === "quorum";
 }
 
 function is_stream(queue) {
-    if (queue["arguments"]) {
-        if (queue["arguments"]["x-queue-type"]) {
-            return queue["arguments"]["x-queue-type"] === "stream";
-        } else {
-            return false;
-        }
-    } else {
-        return false;
-    }
+    return get_queue_type(queue) === "stream";
 }
 
 function is_classic(queue) {
-    if (queue["arguments"]) {
-        if (queue["arguments"]["x-queue-type"]) {
-            return queue["arguments"]["x-queue-type"] === "classic";
-        } else {
-            return true;
-        }
-    } else {
-        return true;
-    }
+    return get_queue_type(queue) === "classic";
 }
 
 function ensure_queues_chart_range() {

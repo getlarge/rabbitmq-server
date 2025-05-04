@@ -61,20 +61,28 @@
          is_exclusive/1,
          is_classic/1,
          is_quorum/1,
+         is_internal/1,
+         internal_owner/1,
+         make_internal/1,
+         make_internal/2,
          pattern_match_all/0,
          pattern_match_on_name/1,
          pattern_match_on_type/1,
          pattern_match_on_durable/1,
          pattern_match_on_type_and_durable/2,
+         pattern_match_on_type_and_vhost/2,
          reset_decorators/1,
          set_immutable/1,
          qnode/1,
          to_printable/1,
+         to_printable/2,
          macros/0]).
 
 -define(record_version, amqqueue_v2).
 -define(is_backwards_compat_classic(T),
         (T =:= classic orelse T =:= ?amqqueue_v1_type)).
+
+-type amqqueue_options() ::  map() | ets:match_pattern().
 
 -record(amqqueue, {
           %% immutable
@@ -106,7 +114,7 @@
           slave_pids_pending_shutdown = [], %% reserved
           %% secondary index
           vhost :: rabbit_types:vhost() | undefined | ets:match_pattern(),
-          options = #{} :: map() | ets:match_pattern(),
+          options = #{} :: amqqueue_options(),
           type = ?amqqueue_v1_type :: module() | ets:match_pattern(),
           type_state = #{} :: map() | ets:match_pattern()
          }).
@@ -349,6 +357,19 @@ get_arguments(#amqqueue{arguments = Args}) ->
 set_arguments(#amqqueue{} = Queue, Args) ->
     Queue#amqqueue{arguments = Args}.
 
+% options
+
+-spec get_options(amqqueue()) -> amqqueue_options().
+
+get_options(#amqqueue{options = Options}) ->
+    Options.
+
+-spec set_options(amqqueue(), amqqueue_options()) -> amqqueue().
+
+set_options(#amqqueue{} = Queue, Options) ->
+    Queue#amqqueue{options = Options}.
+
+
 % decorators
 
 -spec get_decorators(amqqueue()) -> [atom()] | none | undefined.
@@ -392,15 +413,6 @@ get_name(#amqqueue{name = Name}) -> Name.
 
 set_name(#amqqueue{} = Queue, Name) ->
     Queue#amqqueue{name = Name}.
-
--spec get_options(amqqueue()) -> map().
-
-get_options(#amqqueue{options = Options}) -> Options.
-
--spec set_options(amqqueue(), map()) -> amqqueue().
-
-set_options(#amqqueue{} = Queue, Options) ->
-    Queue#amqqueue{options = Options}.
 
 % pid
 
@@ -495,6 +507,32 @@ is_classic(Queue) ->
 is_quorum(Queue) ->
     get_type(Queue) =:= rabbit_quorum_queue.
 
+-spec is_internal(amqqueue()) -> boolean().
+
+is_internal(#amqqueue{options = #{internal := true}}) -> true;
+is_internal(#amqqueue{}) -> false.
+
+-spec internal_owner(amqqueue()) -> rabbit_types:option(#resource{}).
+
+internal_owner(#amqqueue{options = #{internal := true,
+                                     internal_owner := IOwner}}) ->
+    IOwner;
+internal_owner(#amqqueue{}) ->
+    undefined.
+
+-spec make_internal(amqqueue()) -> amqqueue().
+
+make_internal(Q = #amqqueue{options = Options}) when is_map(Options) ->
+    Q#amqqueue{options = maps:merge(Options, #{internal => true,
+                                               internal_owner => undefined})}.
+
+-spec make_internal(amqqueue(), rabbit_types:r(queue | exchange)) -> amqqueue().
+
+make_internal(Q = #amqqueue{options = Options}, Owner)
+  when is_map(Options) andalso is_record(Owner, resource) ->
+    Q#amqqueue{options = maps:merge(Options, #{internal => true,
+                                              interna_owner => Owner})}.
+
 fields() ->
     fields(?record_version).
 
@@ -531,6 +569,12 @@ pattern_match_on_durable(IsDurable) ->
 pattern_match_on_type_and_durable(Type, IsDurable) ->
     #amqqueue{type = Type, durable = IsDurable, _ = '_'}.
 
+-spec pattern_match_on_type_and_vhost(atom(), binary()) ->
+    amqqueue_pattern().
+
+pattern_match_on_type_and_vhost(Type, VHost) ->
+    #amqqueue{type = Type, vhost = VHost, _ = '_'}.
+
 -spec reset_decorators(amqqueue()) -> amqqueue().
 
 reset_decorators(#amqqueue{} = Queue) ->
@@ -559,6 +603,14 @@ qnode({_, Node}) ->
 -spec to_printable(amqqueue()) -> #{binary() => any()}.
 to_printable(#amqqueue{name = QName = #resource{name = Name},
                        vhost = VHost, type = Type}) ->
+     #{<<"readable_name">> => rabbit_data_coercion:to_binary(rabbit_misc:rs(QName)),
+       <<"name">> => Name,
+       <<"virtual_host">> => VHost,
+       <<"type">> => Type}.
+
+-spec to_printable(rabbit_types:r(queue), atom() | binary()) -> #{binary() => any()}.
+to_printable(QName = #resource{name = Name, virtual_host = VHost}, Type) ->
+    _ = rabbit_queue_type:discover(Type),
      #{<<"readable_name">> => rabbit_data_coercion:to_binary(rabbit_misc:rs(QName)),
        <<"name">> => Name,
        <<"virtual_host">> => VHost,

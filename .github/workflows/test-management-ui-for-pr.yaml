@@ -15,11 +15,11 @@ jobs:
       fail-fast: false
       matrix:
         erlang_version:
-        - "26.2"
+        - "27.3"
         browser:
         - chrome
         include:
-        - erlang_version: "26.2"
+        - erlang_version: "27.3"
           elixir_version: 1.17
     env:
       SELENIUM_DIR: selenium
@@ -38,7 +38,7 @@ jobs:
           https://cdn.jsdelivr.net/hex
 
     - name: Authenticate To Google Cloud
-      uses: google-github-actions/auth@v2.1.7
+      uses: google-github-actions/auth@v2.1.10
       with:
         credentials_json: ${{ secrets.REMOTE_CACHE_CREDENTIALS_JSON }}
 
@@ -56,27 +56,22 @@ jobs:
         cd ${SELENIUM_DIR}
         docker build -t mocha-test --target test .
 
-    - name: Run short ui suites on a standalone rabbitmq server
+    - name: Run short UI suites on a standalone rabbitmq server
       run: |
         IMAGE_TAG=$(find PACKAGES/rabbitmq-server-generic-unix-*.tar.xz | awk -F 'PACKAGES/rabbitmq-server-generic-unix-|.tar.xz' '{print $2}')
         RABBITMQ_DOCKER_IMAGE=pivotalrabbitmq/rabbitmq:$IMAGE_TAG \
           ${SELENIUM_DIR}/run-suites.sh short-suite-management-ui        
+
+    - name: Prepare logs for upload
+      if: ${{ failure() && steps.tests.outcome == 'failed' }}
+      run: |
         mkdir -p /tmp/short-suite
         mv /tmp/selenium/* /tmp/short-suite
         
     - name: Upload Test Artifacts
-      if: always()
-      uses: actions/upload-artifact@v4.3.2
+      if: ${{ failure() && steps.tests.outcome == 'failed' }}
+      uses: actions/upload-artifact@v4
       with:
         name: test-artifacts-${{ matrix.browser }}-${{ matrix.erlang_version }}
         path: |
           /tmp/short-suite
-
-  summary-selenium:
-    needs:
-    - selenium
-    runs-on: ubuntu-latest
-    steps:
-    - name: SUMMARY
-      run: |
-        echo "SUCCESS"

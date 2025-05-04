@@ -82,6 +82,9 @@
          file_handle_other_reservation/0,
          file_handle_release_reservation/0]).
 
+-export([leader_health_check/2,
+         run_leader_health_check/4]).
+
 -ifdef(TEST).
 -export([filter_promotable/2,
          ra_machine_config/1]).
@@ -142,8 +145,11 @@
 -define(DELETE_TIMEOUT, 5000).
 -define(MEMBER_CHANGE_TIMEOUT, 20_000).
 -define(SNAPSHOT_INTERVAL, 8192). %% the ra default is 4096
-% -define(UNLIMITED_PREFETCH_COUNT, 2000). %% something large for ra
--define(MIN_CHECKPOINT_INTERVAL, 8192). %% the ra default is 16384
+%% setting a low default here to allow quorum queues to better chose themselves
+%% when to take a checkpoint
+-define(MIN_CHECKPOINT_INTERVAL, 64).
+-define(LEADER_HEALTH_CHECK_TIMEOUT, 5_000).
+-define(GLOBAL_LEADER_HEALTH_CHECK_TIMEOUT, 60_000).
 
 %%----------- QQ policies ---------------------------------------------------
 
@@ -260,7 +266,8 @@ start_cluster(Q) ->
                                     #{nodes => [LeaderNode | FollowerNodes]}),
 
     Versions = [V || {ok, V} <- erpc:multicall(FollowerNodes,
-                                               rabbit_fifo, version, [])],
+                                               rabbit_fifo, version, [],
+                                               ?RPC_TIMEOUT)],
     MinVersion = lists:min([rabbit_fifo:version() | Versions]),
 
     rabbit_log:debug("Will start up to ~w replicas for quorum queue ~ts with "
@@ -419,11 +426,10 @@ local_or_remote_handler(ChPid, Module, Function, Args) ->
             erpc:cast(Node, Module, Function, Args)
     end.
 
-become_leader(QName, Name) ->
-    %% as this function is called synchronously when a ra node becomes leader
-    %% we need to ensure there is no chance of blocking as else the ra node
-    %% may not be able to establish its leadership
-    spawn(fun () -> become_leader0(QName, Name) end).
+become_leader(_QName, _Name) ->
+    %% noop now as we instead rely on the promt tick_timeout + repair to update
+    %% the meta data store after a leader change
+    ok.
 
 become_leader0(QName, Name) ->
     Fun = fun (Q1) ->
@@ -574,11 +580,11 @@ handle_tick(QName,
             Nodes) ->
     %% this makes calls to remote processes so cannot be run inside the
     %% ra server
-    Self = self(),
     spawn(
       fun() ->
               try
                   {ok, Q} = rabbit_amqqueue:lookup(QName),
+                  ok = repair_leader_record(Q, Name),
                   Reductions = reductions(Name),
                   rabbit_core_metrics:queue_stats(QName, NumReadyMsgs,
                                                   NumCheckedOut, NumMessages,
@@ -632,12 +638,12 @@ handle_tick(QName,
                                             end}
                            | Infos0],
                   rabbit_core_metrics:queue_stats(QName, Infos),
-                  ok = repair_leader_record(Q, Self),
                   case repair_amqqueue_nodes(Q) of
                       ok ->
                           ok;
                       repaired ->
-                          rabbit_log:debug("Repaired quorum queue ~ts amqqueue record", [rabbit_misc:rs(QName)])
+                          rabbit_log:debug("Repaired quorum queue ~ts amqqueue record",
+                                           [rabbit_misc:rs(QName)])
                   end,
                   ExpectedNodes = rabbit_nodes:list_members(),
                   case Nodes -- ExpectedNodes of
@@ -669,7 +675,7 @@ handle_tick(QName, Config, _Nodes) ->
     rabbit_log:debug("~ts: handle tick received unexpected config format ~tp",
                      [rabbit_misc:rs(QName), Config]).
 
-repair_leader_record(Q, Self) ->
+repair_leader_record(Q, Name) ->
     Node = node(),
     case amqqueue:get_pid(Q) of
         {_, Node} ->
@@ -677,9 +683,8 @@ repair_leader_record(Q, Self) ->
             ok;
         _ ->
             QName = amqqueue:get_name(Q),
-            rabbit_log:debug("~ts: repairing leader record",
-                             [rabbit_misc:rs(QName)]),
-            {_, Name} = erlang:process_info(Self, registered_name),
+            rabbit_log:debug("~ts: updating leader record to current node ~ts",
+                             [rabbit_misc:rs(QName), Node]),
             ok = become_leader0(QName, Name),
             ok
     end,
@@ -965,10 +970,12 @@ dequeue(QName, NoAck, _LimiterPid, CTag0, QState0) ->
               rabbit_queue_type:consume_spec(),
               rabbit_fifo_client:state()) ->
     {ok, rabbit_fifo_client:state(), rabbit_queue_type:actions()} |
-    {error, global_qos_not_supported_for_queue_type | timeout}.
+    {error, atom(), Format :: string(), FormatArgs :: [term()]}.
 consume(Q, #{limiter_active := true}, _State)
   when ?amqqueue_is_quorum(Q) ->
-    {error, global_qos_not_supported_for_queue_type};
+    {error, not_implemented,
+     "~ts does not support global qos",
+     [rabbit_misc:rs(amqqueue:get_name(Q))]};
 consume(Q, Spec, QState0) when ?amqqueue_is_quorum(Q) ->
     #{no_ack := NoAck,
       channel_pid := ChPid,
@@ -1002,45 +1009,57 @@ consume(Q, Spec, QState0) when ?amqqueue_is_quorum(Q) ->
                      args => Args,
                      username => ActingUser,
                      priority => Priority},
-    {ok, _Infos, QState} = rabbit_fifo_client:checkout(ConsumerTag,
-                                                       Mode, ConsumerMeta,
-                                                       QState0),
-    case single_active_consumer_on(Q) of
-        true ->
-            %% get the leader from state
-            case rabbit_fifo_client:query_single_active_consumer(QState) of
-                {ok, SacResult} ->
-                    ActivityStatus = case SacResult of
-                                         {value, {ConsumerTag, ChPid}} ->
-                                             single_active;
-                                         _ ->
-                                             waiting
-                                     end,
-                    rabbit_core_metrics:consumer_created(
-                      ChPid, ConsumerTag, ExclusiveConsume,
-                      AckRequired, QName,
-                      Prefetch, ActivityStatus == single_active, %% Active
-                      ActivityStatus, Args),
+    case rabbit_fifo_client:checkout(ConsumerTag, Mode, ConsumerMeta, QState0) of
+        {ok, _Infos, QState} ->
+            case single_active_consumer_on(Q) of
+                true ->
+                    %% get the leader from state
+                    case rabbit_fifo_client:query_single_active_consumer(QState) of
+                        {ok, SacResult} ->
+                            ActivityStatus = case SacResult of
+                                                 {value, {ConsumerTag, ChPid}} ->
+                                                     single_active;
+                                                 _ ->
+                                                     waiting
+                                             end,
+                            rabbit_core_metrics:consumer_created(ChPid, ConsumerTag,
+                                                                 ExclusiveConsume,
+                                                                 AckRequired, QName,
+                                                                 Prefetch,
+                                                                 ActivityStatus == single_active,
+                                                                 ActivityStatus, Args),
+                            emit_consumer_created(ChPid, ConsumerTag,
+                                                  ExclusiveConsume,
+                                                  AckRequired, QName,
+                                                  Prefetch, Args, none,
+                                                  ActingUser),
+                            {ok, QState};
+                        Err ->
+                            consume_error(Err, QName)
+                    end;
+                false ->
+                    rabbit_core_metrics:consumer_created(ChPid, ConsumerTag,
+                                                         ExclusiveConsume,
+                                                         AckRequired, QName,
+                                                         Prefetch, true,
+                                                         up, Args),
                     emit_consumer_created(ChPid, ConsumerTag, ExclusiveConsume,
                                           AckRequired, QName, Prefetch,
                                           Args, none, ActingUser),
-                    {ok, QState};
-                {error, Error} ->
-                    Error;
-                {timeout, _} ->
-                    {error, timeout}
+                    {ok, QState}
             end;
-        false ->
-            rabbit_core_metrics:consumer_created(
-              ChPid, ConsumerTag, ExclusiveConsume,
-              AckRequired, QName,
-              Prefetch, true, %% Active
-              up, Args),
-            emit_consumer_created(ChPid, ConsumerTag, ExclusiveConsume,
-                                  AckRequired, QName, Prefetch,
-                                  Args, none, ActingUser),
-            {ok, QState}
+        Err ->
+            consume_error(Err, QName)
     end.
+
+consume_error({error, Reason}, QName) ->
+    {error, internal_error,
+     "failed consuming from quorum ~ts: ~tp",
+     [rabbit_misc:rs(QName), Reason]};
+consume_error({timeout, RaServerId}, QName) ->
+    {error, internal_error,
+     "timed out consuming from quorum ~ts: ~tp",
+     [rabbit_misc:rs(QName), RaServerId]}.
 
 cancel(_Q, #{consumer_tag := ConsumerTag} = Spec, State) ->
     maybe_send_reply(self(), maps:get(ok_msg, Spec, undefined)),
@@ -1746,8 +1765,9 @@ i(leader, Q) -> leader(Q);
 i(open_files, Q) when ?is_amqqueue(Q) ->
     {Name, _} = amqqueue:get_pid(Q),
     Nodes = get_connected_nodes(Q),
-    {Data, _} = rpc:multicall(Nodes, ?MODULE, open_files, [Name]),
-    lists:flatten(Data);
+    [Info || {ok, {_, _} = Info} <-
+             erpc:multicall(Nodes, ?MODULE, open_files,
+                            [Name], ?RPC_TIMEOUT)];
 i(single_active_consumer_pid, Q) when ?is_amqqueue(Q) ->
     QPid = amqqueue:get_pid(Q),
     case ra:local_query(QPid, fun rabbit_fifo:query_single_active_consumer/1) of
@@ -1866,7 +1886,8 @@ online(Q) when ?is_amqqueue(Q) ->
     Nodes = get_connected_nodes(Q),
     {Name, _} = amqqueue:get_pid(Q),
     [node(Pid) || {ok, Pid} <-
-                  erpc:multicall(Nodes, erlang, whereis, [Name]),
+                  erpc:multicall(Nodes, erlang, whereis,
+                                 [Name], ?RPC_TIMEOUT),
                   is_pid(Pid)].
 
 format(Q, Ctx) when ?is_amqqueue(Q) ->
@@ -1894,7 +1915,7 @@ format(Q, Ctx) when ?is_amqqueue(Q) ->
                             down
                     end
             end,
-    [{type, quorum},
+    [{type, rabbit_queue_type:short_alias_of(?MODULE)},
      {state, State},
      {node, LeaderNode},
      {members, Nodes},
@@ -2145,3 +2166,75 @@ file_handle_other_reservation() ->
 file_handle_release_reservation() ->
     ok.
 
+leader_health_check(QueueNameOrRegEx, VHost) ->
+    %% Set a process limit threshold to 20% of ErlangVM process limit, beyond which
+    %% we cannot spawn any new processes for executing QQ leader health checks.
+    ProcessLimitThreshold = round(0.2 * erlang:system_info(process_limit)),
+
+    leader_health_check(QueueNameOrRegEx, VHost, ProcessLimitThreshold).
+
+leader_health_check(QueueNameOrRegEx, VHost, ProcessLimitThreshold) ->
+    Qs =
+        case VHost of
+            across_all_vhosts ->
+                rabbit_db_queue:get_all_by_type(?MODULE);
+            VHost when is_binary(VHost) ->
+                rabbit_db_queue:get_all_by_type_and_vhost(?MODULE, VHost)
+        end,
+    check_process_limit_safety(length(Qs), ProcessLimitThreshold),
+    ParentPID = self(),
+    HealthCheckRef = make_ref(),
+    HealthCheckPids =
+        lists:flatten(
+            [begin
+                {resource, _VHostN, queue, QueueName} = QResource = amqqueue:get_name(Q),
+                case re:run(QueueName, QueueNameOrRegEx, [{capture, none}]) of
+                    match ->
+                        {ClusterName, _} = rabbit_amqqueue:pid_of(Q),
+                        _Pid = spawn(fun() -> run_leader_health_check(ClusterName, QResource, HealthCheckRef, ParentPID) end);
+                    _ ->
+                        []
+                end
+            end || Q <- Qs, amqqueue:get_type(Q) == ?MODULE]),
+    Result = wait_for_leader_health_checks(HealthCheckRef, length(HealthCheckPids), []),
+    _ = spawn(fun() -> maybe_log_leader_health_check_result(Result) end),
+    Result.
+
+run_leader_health_check(ClusterName, QResource, HealthCheckRef, From) ->
+    Leader = ra_leaderboard:lookup_leader(ClusterName),
+
+    %% Ignoring result here is required to clear a diayzer warning.
+    _ =
+        case ra_server_proc:ping(Leader, ?LEADER_HEALTH_CHECK_TIMEOUT) of
+            {pong,leader} ->
+                From ! {ok, HealthCheckRef, QResource};
+            _ ->
+                From ! {error, HealthCheckRef, QResource}
+        end,
+    ok.
+
+wait_for_leader_health_checks(_Ref, 0, UnhealthyAcc) -> UnhealthyAcc;
+wait_for_leader_health_checks(Ref, N, UnhealthyAcc) ->
+    receive
+        {ok, Ref, _QResource} ->
+            wait_for_leader_health_checks(Ref, N - 1, UnhealthyAcc);
+        {error, Ref, QResource} ->
+            wait_for_leader_health_checks(Ref, N - 1, [amqqueue:to_printable(QResource, ?MODULE) | UnhealthyAcc])
+    after
+        ?GLOBAL_LEADER_HEALTH_CHECK_TIMEOUT ->
+            UnhealthyAcc
+    end.
+
+check_process_limit_safety(QCount, ProcessLimitThreshold) ->
+    case (erlang:system_info(process_count) + QCount) >= ProcessLimitThreshold of
+        true ->
+            rabbit_log:warning("Leader health check not permitted, process limit threshold will be exceeded."),
+            throw({error, leader_health_check_process_limit_exceeded});
+        false ->
+            ok
+    end.
+
+maybe_log_leader_health_check_result([]) -> ok;
+maybe_log_leader_health_check_result(Result) ->
+    Qs = lists:map(fun(R) -> catch maps:get(<<"readable_name">>, R) end, Result),
+    rabbit_log:warning("Leader health check result (unhealthy leaders detected): ~tp", [Qs]).

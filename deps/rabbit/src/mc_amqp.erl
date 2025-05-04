@@ -17,6 +17,8 @@
          prepare/2
         ]).
 
+-export([init_from_stream/2]).
+
 -import(rabbit_misc,
         [maps_put_truthy/3]).
 
@@ -47,6 +49,29 @@
 -type amqp_annotations() :: [{Key :: {symbol, binary()} | {ulong, non_neg_integer()},
                               Val :: term()}].
 -type opt(T) :: T | undefined.
+
+%% This representation was used in v3.13.7. 4.x understands this record for
+%% backward compatibility, specifically for the rare case where:
+%% 1. a 3.13 node internally parsed a message from a stream via
+%% ```
+%% Message = mc:init(mc_amqp, amqp10_framing:decode_bin(Bin), #{})
+%% ```
+%% 2. published this Message to a queue
+%% 3. RabbitMQ got upgraded to 4.x
+%%
+%% This record along with all its conversions in this module can therefore
+%% be deleted in some future RabbitMQ version once it's safe to assume that
+%% these upgraded messages have all been consumed.
+-record(msg,
+        {
+         header :: opt(#'v1_0.header'{}),
+         delivery_annotations = []:: list(),
+         message_annotations = [] :: list(),
+         properties :: opt(#'v1_0.properties'{}),
+         application_properties = [] :: list(),
+         data = [] :: amqp10_data(),
+         footer = [] :: list()
+        }).
 
 %% This representation is used when the message was originally sent with
 %% a protocol other than AMQP and the message was not read from a stream.
@@ -95,14 +120,30 @@
          body_code :: body_descriptor_code()
         }).
 
--opaque state() :: #msg_body_decoded{} | #msg_body_encoded{} | #v1{}.
+-opaque state() :: #msg{} | #msg_body_decoded{} | #msg_body_encoded{} | #v1{}.
 
 -export_type([state/0]).
 
+%% API
+
+-spec init_from_stream(binary(), mc:annotations()) ->
+    mc:state().
+init_from_stream(Payload, #{} = Anns0) ->
+    Sections = amqp10_framing:decode_bin(Payload, [server_mode]),
+    Msg = msg_body_encoded(Sections, Payload, #msg_body_encoded{}),
+    %% when initalising from stored stream data the recovered
+    %% annotations take precendence over the ones provided
+    Anns = maps:merge(Anns0, essential_properties(Msg, recover)),
+    mc:init(?MODULE, Msg, Anns).
+
+%% CALLBACKS
+
+init(#msg_body_encoded{} = Msg) ->
+    {Msg, #{}};
 init(Payload) ->
     Sections = amqp10_framing:decode_bin(Payload, [server_mode]),
     Msg = msg_body_encoded(Sections, Payload, #msg_body_encoded{}),
-    Anns = essential_properties(Msg),
+    Anns = essential_properties(Msg, new),
     {Msg, Anns}.
 
 convert_from(?MODULE, Sections, _Env) when is_list(Sections) ->
@@ -110,6 +151,8 @@ convert_from(?MODULE, Sections, _Env) when is_list(Sections) ->
 convert_from(_SourceProto, _, _Env) ->
     not_implemented.
 
+convert_to(?MODULE, Msg = #msg{}, _Env) ->
+    convert_from_3_13_msg(Msg);
 convert_to(?MODULE, Msg, _Env) ->
     Msg;
 convert_to(TargetProto, Msg, Env) ->
@@ -121,7 +164,22 @@ size(#v1{message_annotations = MA,
                    [] -> 0;
                    _ -> ?MESSAGE_ANNOTATIONS_GUESS_SIZE
                end,
-    {MetaSize, byte_size(Body)}.
+    {MetaSize, byte_size(Body)};
+%% Copied from v3.13.7.
+%% This might be called in rabbit_fifo_v3 and must therefore not be modified
+%% to ensure determinism of quorum queues version 3.
+size(#msg{data = Body}) ->
+    BodySize = if is_list(Body) ->
+                      lists:foldl(
+                        fun(#'v1_0.data'{content = Data}, Acc) ->
+                                iolist_size(Data) + Acc;
+                           (#'v1_0.amqp_sequence'{content = _}, Acc) ->
+                                Acc
+                        end, 0, Body);
+                  is_record(Body, 'v1_0.amqp_value') ->
+                      0
+               end,
+    {_MetaSize = 0, BodySize}.
 
 x_header(Key, Msg) ->
     message_annotation(Key, Msg, undefined).
@@ -132,6 +190,10 @@ x_headers(Msg) ->
 property(_Prop, #msg_body_encoded{properties = undefined}) ->
     undefined;
 property(Prop, #msg_body_encoded{properties = Props}) ->
+    property0(Prop, Props);
+property(_Prop, #msg{properties = undefined}) ->
+    undefined;
+property(Prop, #msg{properties = Props}) ->
     property0(Prop, Props);
 property(_Prop, #v1{bare_and_footer_properties_pos = ?OMITTED_SECTION}) ->
     undefined;
@@ -280,7 +342,9 @@ protocol_state(#v1{message_annotations = MA0,
                                                     ttl = Ttl}, Anns),
     MA = protocol_state_message_annotations(MA0, Anns),
     Sections = to_sections(Header, MA, []),
-    [encode(Sections), BareAndFooter].
+    [encode(Sections), BareAndFooter];
+protocol_state(#msg{} = Msg, Anns) ->
+    protocol_state(convert_from_3_13_msg(Msg), Anns).
 
 prepare(read, Msg) ->
     Msg;
@@ -304,7 +368,9 @@ prepare(store, #msg_body_encoded{
         bare_and_footer_application_properties_pos = AppPropsPos,
         bare_and_footer_body_pos = BodyPos,
         body_code = BodyCode
-       }.
+       };
+prepare(store, Msg = #msg{}) ->
+    Msg.
 
 %% internal
 
@@ -361,7 +427,9 @@ msg_to_sections(#v1{message_annotations = MAC,
                    Sections = amqp10_framing:decode_bin(Bin),
                    Sections ++ [{amqp_encoded_body_and_footer, BodyAndFooterBin}]
            end,
-    to_sections(undefined, MAC, Tail).
+    to_sections(undefined, MAC, Tail);
+msg_to_sections(#msg{} = Msg) ->
+    msg_to_sections(convert_from_3_13_msg(Msg)).
 
 to_sections(H, MAC, P, APC, Tail) ->
     S0 = case APC of
@@ -391,6 +459,20 @@ to_sections(H, MAC, Tail) ->
         _ ->
             [H | S]
     end.
+
+convert_from_3_13_msg(#msg{header = H,
+                           delivery_annotations = _,
+                           message_annotations = MAC,
+                           properties = P,
+                           application_properties = APC,
+                           data = Data,
+                           footer = FC}) ->
+    #msg_body_decoded{header = H,
+                      message_annotations = MAC,
+                      properties = P,
+                      application_properties = APC,
+                      data = Data,
+                      footer = FC}.
 
 -spec protocol_state_message_annotations(amqp_annotations(), mc:annotations()) ->
     amqp_annotations().
@@ -464,11 +546,14 @@ message_annotation(Key, State, Default)
 
 message_annotations(#msg_body_decoded{message_annotations = L}) -> L;
 message_annotations(#msg_body_encoded{message_annotations = L}) -> L;
-message_annotations(#v1{message_annotations = L}) -> L.
+message_annotations(#v1{message_annotations = L}) -> L;
+message_annotations(#msg{message_annotations = L}) -> L.
 
 message_annotations_as_simple_map(#msg_body_encoded{message_annotations = Content}) ->
     message_annotations_as_simple_map0(Content);
 message_annotations_as_simple_map(#v1{message_annotations = Content}) ->
+    message_annotations_as_simple_map0(Content);
+message_annotations_as_simple_map(#msg{message_annotations = Content}) ->
     message_annotations_as_simple_map0(Content).
 
 message_annotations_as_simple_map0(Content) ->
@@ -482,6 +567,9 @@ message_annotations_as_simple_map0(Content) ->
 
 application_properties_as_simple_map(
   #msg_body_encoded{application_properties = Content}, L) ->
+    application_properties_as_simple_map0(Content, L);
+application_properties_as_simple_map(
+  #msg{application_properties = Content}, L) ->
     application_properties_as_simple_map0(Content, L);
 application_properties_as_simple_map(
   #v1{bare_and_footer_application_properties_pos = ?OMITTED_SECTION}, L) ->
@@ -622,16 +710,47 @@ encode_deaths(Deaths) ->
               {map, Map}
       end, Deaths).
 
-essential_properties(Msg) ->
+essential_properties(#msg_body_encoded{} = Msg, new) ->
     Durable = get_property(durable, Msg),
     Priority = get_property(priority, Msg),
     Timestamp = get_property(timestamp, Msg),
     Ttl = get_property(ttl, Msg),
-    Anns = #{?ANN_DURABLE => Durable},
-    maps_put_truthy(
-      ?ANN_PRIORITY, Priority,
-      maps_put_truthy(
-        ?ANN_TIMESTAMP, Timestamp,
-        maps_put_truthy(
-          ttl, Ttl,
-          Anns))).
+    Anns0 = #{?ANN_DURABLE => Durable},
+    Anns = maps_put_truthy(
+             ?ANN_PRIORITY, Priority,
+             maps_put_truthy(
+               ?ANN_TIMESTAMP, Timestamp,
+               maps_put_truthy(
+                 ttl, Ttl,
+                 Anns0))),
+    Anns;
+essential_properties(#msg_body_encoded{message_annotations = MA} = Msg, recover) ->
+    Anns = essential_properties(Msg, new),
+    case MA of
+        [] ->
+            Anns;
+        _ ->
+            lists:foldl(
+              fun ({{symbol, <<"x-routing-key">>},
+                    {utf8, Key}}, Acc) ->
+                      maps:update_with(?ANN_ROUTING_KEYS,
+                                       fun(L) -> [Key | L] end,
+                                       [Key],
+                                       Acc);
+                  ({{symbol, <<"x-cc">>},
+                    {list, CCs0}}, Acc) ->
+                      CCs = [CC || {_T, CC} <- CCs0],
+                      maps:update_with(?ANN_ROUTING_KEYS,
+                                       fun(L) -> L ++ CCs end,
+                                       CCs,
+                                       Acc);
+                  ({{symbol, <<"x-exchange">>},
+                    {utf8, Exchange}}, Acc) ->
+                      Acc#{?ANN_EXCHANGE => Exchange};
+                  ({{symbol, <<"x-opt-rabbitmq-received-time">>},
+                    {timestamp, Ts}}, Acc) ->
+                      Acc#{?ANN_RECEIVED_AT_TIMESTAMP => Ts};
+                  (_, Acc) ->
+                      Acc
+              end, Anns, MA)
+    end.

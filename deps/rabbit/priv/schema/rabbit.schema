@@ -1370,6 +1370,13 @@ fun(Conf) ->
     end
 end}.
 
+%% Register node during cluster formation when backend supports registration.
+%%
+
+{mapping, "cluster_formation.registration.enabled", "rabbit.cluster_formation.perform_registration", [
+    {datatype, {enum, [true, false]}}
+]}.
+
 %% Cluster formation: lock acquisition retries as passed to https://erlang.org/doc/man/global.html#set_lock-3
 %%
 %% Currently used in classic, k8s, and aws peer discovery backends.
@@ -1394,10 +1401,19 @@ end}.
     ]}.
 
 {mapping, "cluster_formation.discovery_retry_limit", "rabbit.cluster_formation.discovery_retry_limit",
-    [
-     {datatype, integer},
-     {validators, ["non_zero_positive_integer"]}
-    ]}.
+    [{datatype, [{atom, unlimited}, integer]}]}.
+
+{translation, "rabbit.cluster_formation.discovery_retry_limit",
+ fun(Conf) ->
+   case cuttlefish:conf_get("cluster_formation.discovery_retry_limit", Conf, undefined) of
+      undefined -> cuttlefish:unset();
+      unlimited  -> unlimited;
+      Val when is_integer(Val) andalso Val > 0 -> Val;
+      _         -> cuttlefish:invalid("should be positive integer or 'unlimited'")
+  end
+ end
+}.
+
 {mapping, "cluster_formation.discovery_retry_interval", "rabbit.cluster_formation.discovery_retry_interval",
     [
      {datatype, integer},
@@ -2594,6 +2610,15 @@ end}.
 {mapping, "quorum_queue.property_equivalence.relaxed_checks_on_redeclaration", "rabbit.quorum_relaxed_checks_on_redeclaration", [
     {datatype, {enum, [true, false]}}]}.
 
+{mapping, "quorum_queue.initial_cluster_size", "rabbit.quorum_cluster_size", [
+  {datatype, integer},
+  {validators, ["non_zero_positive_integer"]}
+]}.
+
+{mapping, "quorum_queue.commands_soft_limit", "rabbit.quorum_commands_soft_limit", [
+  {datatype, integer},
+  {validators, ["non_zero_positive_integer"]}
+]}.
 
 %%
 %% Quorum Queue membership reconciliation
@@ -2639,27 +2664,54 @@ end}.
 %%
 %% Message interceptors
 %%
-{mapping, "message_interceptors.incoming.$interceptor.overwrite", "rabbit.incoming_message_interceptors", [
+
+{mapping, "message_interceptors.$stage.$name.$key", "rabbit.message_interceptors", [
     {datatype, {enum, [true, false]}}]}.
 
-{translation, "rabbit.incoming_message_interceptors",
-    fun(Conf) ->
+{translation, "rabbit.message_interceptors",
+ fun(Conf) ->
          case cuttlefish_variable:filter_by_prefix("message_interceptors", Conf) of
              [] ->
                  cuttlefish:unset();
              L ->
-                 [begin
-                      Interceptor = list_to_atom(Interceptor0),
-                      case lists:member(Interceptor, [set_header_timestamp,
-                                                      set_header_routing_node]) of
-                          true ->
-                              {Interceptor, Overwrite};
-                          false ->
-                              cuttlefish:invalid(io_lib:format("~p is invalid", [Interceptor]))
-                      end
-                  end || {["message_interceptors", "incoming", Interceptor0, "overwrite"], Overwrite} <- L]
+                 lists:foldr(
+                   fun({["message_interceptors", "incoming", "set_header_routing_node", "overwrite"], Overwrite}, Acc)
+                         when is_boolean(Overwrite) ->
+                           Mod = rabbit_msg_interceptor_routing_node,
+                           Cfg = #{overwrite => Overwrite},
+                           [{Mod, Cfg} | Acc];
+                      ({["message_interceptors", "incoming", "set_header_timestamp", "overwrite"], Overwrite}, Acc)
+                        when is_boolean(Overwrite) ->
+                           Mod = rabbit_msg_interceptor_timestamp,
+                           Cfg = #{incoming => true,
+                                   overwrite => Overwrite},
+                           case lists:keytake(Mod, 1, Acc) of
+                               false ->
+                                   [{Mod, Cfg} | Acc];
+                               {value, {Mod, Cfg1}, Acc1} ->
+                                   Cfg2 = maps:merge(Cfg1, Cfg),
+                                   [{Mod, Cfg2} | Acc1]
+                           end;
+                      ({["message_interceptors", "outgoing", "timestamp", "enabled"], Enabled}, Acc) ->
+                           case Enabled of
+                               true ->
+                                   Mod = rabbit_msg_interceptor_timestamp,
+                                   Cfg = #{outgoing => true},
+                                   case lists:keytake(Mod, 1, Acc) of
+                                       false ->
+                                           [{Mod, Cfg} | Acc];
+                                       {value, {Mod, Cfg1}, Acc1} ->
+                                           Cfg2 = maps:merge(Cfg1, Cfg),
+                                           [{Mod, Cfg2} | Acc1]
+                                   end;
+                               false ->
+                                   Acc
+                           end;
+                      (Other, _Acc) ->
+                           cuttlefish:invalid(io_lib:format("~p is invalid", [Other]))
+                   end, [], L)
          end
-    end
+ end
 }.
 
 {mapping, "stream.replication.port_range.min", "osiris.port_range", [

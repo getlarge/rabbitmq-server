@@ -544,7 +544,7 @@ publish_delivered(Msg, MsgProps, ChPid, State) ->
                            State),
     {SeqId, a(maybe_update_rates(State1))}.
 
-discard(_MsgId, _ChPid, State) -> State.
+discard(_Msg, _ChPid, State) -> State.
 
 drain_confirmed(State = #vqstate { confirmed = C }) ->
     case sets:is_empty(C) of
@@ -1880,6 +1880,7 @@ determine_persist_to(Msg,
     %% via the direct client), we make a guess based on the number of
     %% headers.
 
+    %% @todo We can probably simplify this.
     {MetaSize, _BodySize} = mc:size(Msg),
      case BodySize >= IndexMaxSize of
          true  -> msg_store;

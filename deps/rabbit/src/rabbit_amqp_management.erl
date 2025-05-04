@@ -80,7 +80,7 @@ handle_http_req(<<"GET">>,
                 _User,
                 _ConnPid,
                 PermCaches) ->
-    QNameBin = rabbit_uri:urldecode(QNameBinQuoted),
+    QNameBin = cow_uri:urldecode(QNameBinQuoted),
     QName = queue_resource(Vhost, QNameBin),
     case rabbit_amqqueue:with(
            QName,
@@ -110,7 +110,7 @@ handle_http_req(HttpMethod = <<"PUT">>,
       exclusive := Exclusive,
       arguments := QArgs0
      } = decode_queue(ReqPayload),
-    QNameBin = rabbit_uri:urldecode(QNameBinQuoted),
+    QNameBin = cow_uri:urldecode(QNameBinQuoted),
     Owner = case Exclusive of
                 true -> ConnPid;
                 false -> none
@@ -127,7 +127,6 @@ handle_http_req(HttpMethod = <<"PUT">>,
     PermCache1 = check_resource_access(QName, configure, User, PermCache0),
     rabbit_core_metrics:queue_declared(QName),
 
-    {Q1, NumMsgs, NumConsumers, StatusCode, PermCache} =
     case rabbit_amqqueue:with(
            QName,
            fun(Q) ->
@@ -135,7 +134,8 @@ handle_http_req(HttpMethod = <<"PUT">>,
                          Q, Durable, AutoDelete, QArgs, Owner) of
                        ok ->
                            {ok, Msgs, Consumers} = rabbit_amqqueue:stat(Q),
-                           {ok, {Q, Msgs, Consumers, <<"200">>, PermCache1}}
+                           RespPayload = encode_queue(Q, Msgs, Consumers),
+                           {ok, {<<"200">>, RespPayload, {PermCache1, TopicPermCache}}}
                    catch exit:#amqp_error{name = precondition_failed,
                                           explanation = Expl} ->
                              throw(<<"409">>, Expl, []);
@@ -146,23 +146,26 @@ handle_http_req(HttpMethod = <<"PUT">>,
         {ok, Result} ->
             Result;
         {error, not_found} ->
-            PermCache2 = check_dead_letter_exchange(QName, QArgs, User, PermCache1),
+            PermCache = check_dead_letter_exchange(QName, QArgs, User, PermCache1),
+            PermCaches = {PermCache, TopicPermCache},
             try rabbit_amqqueue:declare(
                   QName, Durable, AutoDelete, QArgs, Owner, Username) of
                 {new, Q} ->
                     rabbit_core_metrics:queue_created(QName),
-                    {Q, 0, 0, <<"201">>, PermCache2};
+                    RespPayload = encode_queue(Q, 0, 0),
+                    {<<"201">>, RespPayload, PermCaches};
                 {owner_died, Q} ->
                     %% Presumably our own days are numbered since the
                     %% connection has died. Pretend the queue exists though,
                     %% just so nothing fails.
-                    {Q, 0, 0, <<"201">>, PermCache2};
+                    RespPayload = encode_queue(Q, 0, 0),
+                    {<<"201">>, RespPayload, PermCaches};
                 {absent, Q, Reason} ->
                     absent(Q, Reason);
                 {existing, _Q} ->
                     %% Must have been created in the meantime. Loop around again.
                     handle_http_req(HttpMethod, PathSegments, Query, ReqPayload,
-                                    Vhost, User, ConnPid, {PermCache2, TopicPermCache});
+                                    Vhost, User, ConnPid, PermCaches);
                 {error, queue_limit_exceeded, Reason, ReasonArgs} ->
                     throw(<<"403">>,
                           Reason,
@@ -177,10 +180,7 @@ handle_http_req(HttpMethod = <<"PUT">>,
             end;
         {error, {absent, Q, Reason}} ->
             absent(Q, Reason)
-    end,
-
-    RespPayload = encode_queue(Q1, NumMsgs, NumConsumers),
-    {StatusCode, RespPayload, {PermCache, TopicPermCache}};
+    end;
 
 handle_http_req(<<"PUT">>,
                 [<<"exchanges">>, XNameBinQuoted],
@@ -190,7 +190,7 @@ handle_http_req(<<"PUT">>,
                 User = #user{username = Username},
                 _ConnPid,
                 {PermCache0, TopicPermCache}) ->
-    XNameBin = rabbit_uri:urldecode(XNameBinQuoted),
+    XNameBin = cow_uri:urldecode(XNameBinQuoted),
     #{type := XTypeBin,
       durable := Durable,
       auto_delete := AutoDelete,
@@ -240,7 +240,7 @@ handle_http_req(<<"DELETE">>,
                 User,
                 ConnPid,
                 {PermCache0, TopicPermCache}) ->
-    QNameBin = rabbit_uri:urldecode(QNameBinQuoted),
+    QNameBin = cow_uri:urldecode(QNameBinQuoted),
     QName = queue_resource(Vhost, QNameBin),
     PermCache = check_resource_access(QName, read, User, PermCache0),
     try rabbit_amqqueue:with_exclusive_access_or_die(
@@ -270,7 +270,7 @@ handle_http_req(<<"DELETE">>,
                 User = #user{username = Username},
                 ConnPid,
                 {PermCache0, TopicPermCache}) ->
-    QNameBin = rabbit_uri:urldecode(QNameBinQuoted),
+    QNameBin = cow_uri:urldecode(QNameBinQuoted),
     QName = queue_resource(Vhost, QNameBin),
     ok = prohibit_cr_lf(QNameBin),
     PermCache = check_resource_access(QName, configure, User, PermCache0),
@@ -290,7 +290,7 @@ handle_http_req(<<"DELETE">>,
                 User = #user{username = Username},
                 _ConnPid,
                 {PermCache0, TopicPermCache}) ->
-    XNameBin = rabbit_uri:urldecode(XNameBinQuoted),
+    XNameBin = cow_uri:urldecode(XNameBinQuoted),
     XName = exchange_resource(Vhost, XNameBin),
     ok = prohibit_cr_lf(XNameBin),
     ok = prohibit_default_exchange(XName),
@@ -437,56 +437,47 @@ encode_queue(Q, NumMsgs, NumConsumers) ->
                {{utf8, <<"durable">>}, {boolean, Durable}},
                {{utf8, <<"auto_delete">>}, {boolean, AutoDelete}},
                {{utf8, <<"exclusive">>}, {boolean, Exclusive}},
-               {{utf8, <<"type">>}, {utf8, rabbit_queue_type:to_binary(QType)}},
-               {{utf8, <<"arguments">>}, QArgs}
+               {{utf8, <<"type">>},
+                {utf8, case rabbit_queue_type:short_alias_of(QType) of
+                           undefined ->
+                               atom_to_binary(QType);
+                           ShortName ->
+                               ShortName
+                       end}},
+               {{utf8, <<"arguments">>}, QArgs},
+               {{utf8, <<"replicas">>},
+                {array, utf8, [{utf8, atom_to_binary(R)} || R <- Replicas]}
+               }
               ],
-    KVList1 = if is_list(Replicas) ->
-                     [{{utf8, <<"replicas">>},
-                       {array, utf8, [{utf8, atom_to_binary(R)} || R <- Replicas]}
-                      } | KVList0];
-                 Replicas =:= undefined ->
-                     KVList0
-              end,
     KVList = case Leader of
-                 undefined ->
-                     KVList1;
+                 none ->
+                     KVList0;
                  _ ->
                      [{{utf8, <<"leader">>},
                        {utf8, atom_to_binary(Leader)}
-                      } | KVList1]
+                      } | KVList0]
              end,
     {map, KVList}.
 
 %% The returned Replicas contain both online and offline replicas.
 -spec queue_topology(amqqueue:amqqueue()) ->
-    {Leader :: undefined | node(), Replicas :: undefined | [node(),...]}.
+    {Leader :: node() | none, Replicas :: [node(),...]}.
 queue_topology(Q) ->
-    case amqqueue:get_type(Q) of
-        rabbit_quorum_queue ->
-            [{leader, Leader0},
-             {members, Members}] = rabbit_queue_type:info(Q, [leader, members]),
-            Leader = case Leader0 of
-                         '' -> undefined;
-                         _ -> Leader0
-                     end,
-            {Leader, Members};
-        rabbit_stream_queue ->
-            #{name := StreamId} = amqqueue:get_type_state(Q),
-            case rabbit_stream_coordinator:members(StreamId) of
-                {ok, Members} ->
-                    maps:fold(fun(Node, {_Pid, writer}, {_, Replicas}) ->
-                                      {Node, [Node | Replicas]};
-                                 (Node, {_Pid, replica}, {Writer, Replicas}) ->
-                                      {Writer, [Node | Replicas]}
-                              end, {undefined, []}, Members);
-                {error, _} ->
-                    {undefined, undefined}
-            end;
-        _ ->
-            Pid = amqqueue:get_pid(Q),
-            Node = node(Pid),
-            {Node, [Node]}
-    end.
+    Leader = case amqqueue:get_pid(Q) of
+                 {_RaName, Node} ->
+                     Node;
+                 none ->
+                     none;
+                 Pid ->
+                     node(Pid)
+             end,
+    Replicas = case amqqueue:get_type_state(Q) of
+                   #{nodes := Nodes} ->
+                       Nodes;
+                   _ ->
+                       [Leader]
+               end,
+    {Leader, Replicas}.
 
 decode_exchange({map, KVList}) ->
     M = lists:foldl(
@@ -630,9 +621,9 @@ decode_binding_path_segment(Segment) ->
          end,
     case re:run(Segment, MP, [{capture, all_but_first, binary}]) of
         {match, [SrcQ, <<DstKindChar>>, DstQ, KeyQ, ArgsHash]} ->
-            Src = rabbit_uri:urldecode(SrcQ),
-            Dst = rabbit_uri:urldecode(DstQ),
-            Key = rabbit_uri:urldecode(KeyQ),
+            Src = cow_uri:urldecode(SrcQ),
+            Dst = cow_uri:urldecode(DstQ),
+            Key = cow_uri:urldecode(KeyQ),
             DstKind = destination_char_to_kind(DstKindChar),
             {Src, DstKind, Dst, Key, ArgsHash};
         nomatch ->

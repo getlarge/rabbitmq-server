@@ -559,7 +559,19 @@ consolidate_reads([], Acc) ->
 read_many_file3(MsgIds, CState = #client_msstate{ file_handles_ets = FileHandlesEts,
                                                   client_ref       = Ref }, Acc, File) ->
     mark_handle_closed(FileHandlesEts, File, Ref),
-    read_many_disk(MsgIds, CState, Acc).
+    %% We go back to reading from the cache rather than from disk
+    %% because it is possible that messages are not in a perfect
+    %% order of cache->disk. For example, a fanout message written
+    %% to a previous file by another queue, but then referenced by
+    %% our main queue in between newly written messages: our main
+    %% queue would write MsgA, MsgB, MsgFanout, MsgC, MsgD to the
+    %% current file, then when trying to read from that same current
+    %% file, it would get MsgA and MsgB from the cache; MsgFanout
+    %% from the previous file; and MsgC and MsgD from the cache
+    %% again. So the correct action here is not to continue reading
+    %% from disk but instead to go back to the cache to get MsgC
+    %% and MsgD.
+    read_many_cache(MsgIds, CState, Acc).
 
 -spec contains(rabbit_types:msg_id(), client_msstate()) -> boolean().
 
@@ -1274,19 +1286,26 @@ write_large_message(MsgId, MsgBodyBin,
     ok = index_insert(IndexEts,
            #msg_location { msg_id = MsgId, ref_count = 1, file = LargeMsgFile,
                            offset = 0, total_size = TotalSize }),
-    _ = case CurFile of
+    State1 = case CurFile of
         %% We didn't open a new file. We must update the existing value.
         LargeMsgFile ->
             [_,_] = ets:update_counter(FileSummaryEts, LargeMsgFile,
                                        [{#file_summary.valid_total_size, TotalSize},
-                                        {#file_summary.file_size,        TotalSize}]);
+                                        {#file_summary.file_size,        TotalSize}]),
+            State0;
         %% We opened a new file. We can insert it all at once.
+        %% We must also check whether we need to delete the previous
+        %% current file, because if there is no valid data this is
+        %% the only time we will consider it (outside recovery).
         _ ->
             true = ets:insert_new(FileSummaryEts, #file_summary {
                                     file             = LargeMsgFile,
                                     valid_total_size = TotalSize,
                                     file_size        = TotalSize,
-                                    locked           = false })
+                                    locked           = false }),
+            delete_file_if_empty(CurFile, State0 #msstate { current_file_handle = LargeMsgHdl,
+                                                            current_file        = LargeMsgFile,
+                                                            current_file_offset = TotalSize })
     end,
     %% Roll over to the next file.
     NextFile = LargeMsgFile + 1,
@@ -1299,7 +1318,7 @@ write_large_message(MsgId, MsgBodyBin,
     %% Delete messages from the cache that were written to disk.
     true = ets:match_delete(CurFileCacheEts, {'_', '_', 0}),
     %% Process confirms (this won't flush; we already did) and continue.
-    State = internal_sync(State0),
+    State = internal_sync(State1),
     State #msstate { current_file_handle = NextHdl,
                      current_file        = NextFile,
                      current_file_offset = 0 }.
@@ -1515,27 +1534,37 @@ scan_data(<<Size:64, MsgIdAndMsg:Size/binary, 255, Rest/bits>> = Data,
         %% a remnant from a previous compaction, but it might
         %% simply be a coincidence. Try the next byte.
         #{MsgIdInt := true} ->
-            <<_, Rest2/bits>> = Data,
-            scan_data(Rest2, Fd, Fun, Offset + 1, FileSize, MsgIdsFound, Acc);
+            scan_next_byte(Data, Fd, Fun, Offset, FileSize, MsgIdsFound, Acc);
         %% Data looks to be a message.
         _ ->
-            %% Avoid sub-binary construction.
-            MsgId = <<MsgIdInt:128>>,
             TotalSize = Size + 9,
-            case Fun({MsgId, TotalSize, Offset}) of
-                %% Confirmed to be a message by the provided fun.
-                {valid, Entry} ->
+            case check_msg(Fun, MsgIdInt, TotalSize, Offset, Acc) of
+                {continue, NewAcc} ->
                     scan_data(Rest, Fd, Fun, Offset + TotalSize, FileSize,
-                              MsgIdsFound#{MsgIdInt => true}, [Entry|Acc]);
-                %% Confirmed to be a message but we don't need it anymore.
-                previously_valid ->
-                    scan_data(Rest, Fd, Fun, Offset + TotalSize, FileSize,
-                              MsgIdsFound#{MsgIdInt => true}, Acc);
-                %% Not a message, try the next byte.
-                invalid ->
-                    <<_, Rest2/bits>> = Data,
-                    scan_data(Rest2, Fd, Fun, Offset + 1, FileSize, MsgIdsFound, Acc)
+                              MsgIdsFound#{MsgIdInt => true}, NewAcc);
+                try_next_byte ->
+                    scan_next_byte(Data, Fd, Fun, Offset, FileSize, MsgIdsFound, Acc)
             end
+    end;
+%% Large message alone in its own file
+scan_data(<<Size:64, MsgIdInt:128, _Rest/bits>> = Data, Fd, Fun, Offset, FileSize, _MsgIdsFound, _Acc)
+  when Offset == 0,
+       FileSize == Size + 9 ->
+    {ok, CurrentPos} = file:position(Fd, cur),
+    case file:pread(Fd, FileSize - 1, 1) of
+        {ok, <<255>>} ->
+            TotalSize = FileSize,
+            case check_msg(Fun, MsgIdInt, TotalSize, Offset, []) of
+                {continue, NewAcc} ->
+                    NewAcc;
+                try_next_byte ->
+                    {ok, _} = file:position(Fd, CurrentPos),
+                    scan_next_byte(Data, Fd, Fun, Offset, FileSize, #{}, [])
+            end;
+        _ ->
+            %% Wrong end marker
+            {ok, _} = file:position(Fd, CurrentPos),
+            scan_next_byte(Data, Fd, Fun, Offset, FileSize, #{}, [])
     end;
 %% This might be the start of a message.
 scan_data(<<Size:64, Rest/bits>> = Data, Fd, Fun, Offset, FileSize, MsgIdsFound, Acc)
@@ -1545,8 +1574,26 @@ scan_data(Data, Fd, Fun, Offset, FileSize, MsgIdsFound, Acc)
           when byte_size(Data) < 8 ->
     scan(Data, Fd, Fun, Offset, FileSize, MsgIdsFound, Acc);
 %% This is definitely not a message. Try the next byte.
-scan_data(<<_, Rest/bits>>, Fd, Fun, Offset, FileSize, MsgIdsFound, Acc) ->
+scan_data(Data, Fd, Fun, Offset, FileSize, MsgIdsFound, Acc) ->
+    scan_next_byte(Data, Fd, Fun, Offset, FileSize, MsgIdsFound, Acc).
+
+scan_next_byte(<<_, Rest/bits>>, Fd, Fun, Offset, FileSize, MsgIdsFound, Acc) ->
     scan_data(Rest, Fd, Fun, Offset + 1, FileSize, MsgIdsFound, Acc).
+
+check_msg(Fun, MsgIdInt, TotalSize, Offset, Acc) ->
+    %% Avoid sub-binary construction.
+    MsgId = <<MsgIdInt:128>>,
+    case Fun({MsgId, TotalSize, Offset}) of
+        %% Confirmed to be a message by the provided fun.
+        {valid, Entry} ->
+            {continue, [Entry|Acc]};
+        %% Confirmed to be a message but we don't need it anymore.
+        previously_valid ->
+            {continue, Acc};
+        %% Not a message, try the next byte.
+        invalid ->
+            try_next_byte
+    end.
 
 %%----------------------------------------------------------------------------
 %% Ets index

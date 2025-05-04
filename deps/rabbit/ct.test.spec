@@ -18,7 +18,8 @@
 ,   amqp_credit_api_v2_SUITE
 ,   amqp_filtex_SUITE
 ,   amqp_proxy_protocol_SUITE
-,   amqp_system_SUITE
+,   amqp_dotnet_SUITE
+,   amqp_jms_SUITE
 ,   amqpl_consumer_ack_SUITE
 ,   amqpl_direct_reply_to_SUITE
 ,   amqqueue_backward_compatibility_SUITE
@@ -114,7 +115,7 @@
 ,   rabbit_fifo_prop_SUITE
 ,   rabbit_fifo_v0_SUITE
 ,   rabbit_local_random_exchange_SUITE
-,   rabbit_message_interceptor_SUITE
+,   rabbit_msg_interceptor_SUITE
 ,   rabbit_stream_coordinator_SUITE
 ,   rabbit_stream_sac_coordinator_SUITE
 ,   rabbitmq_4_0_deprecations_SUITE

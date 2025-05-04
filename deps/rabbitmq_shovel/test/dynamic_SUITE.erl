@@ -10,6 +10,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 
+-import(rabbit_ct_helpers, [eventually/1]).
+
 -compile(export_all).
 
 -export([spawn_suspender_proc/1]).
@@ -118,13 +120,17 @@ end_per_testcase(Testcase, Config) ->
 %% -------------------------------------------------------------------
 
 simple(Config) ->
+    Name = <<"test">>,
     with_ch(Config,
       fun (Ch) ->
               shovel_test_utils:set_param(
                 Config,
-                <<"test">>, [{<<"src-queue">>,  <<"src">>},
+                Name, [{<<"src-queue">>,  <<"src">>},
                              {<<"dest-queue">>, <<"dest">>}]),
-              publish_expect(Ch, <<>>, <<"src">>, <<"dest">>, <<"hello">>)
+              publish_expect(Ch, <<>>, <<"src">>, <<"dest">>, <<"hello">>),
+              Status = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_shovel_status, lookup, [{<<"/">>, Name}]),
+              ?assertMatch([_|_], Status),
+              ?assertMatch(#{metrics := #{forwarded := 1}}, maps:from_list(Status))
       end).
 
 quorum_queues(Config) ->
@@ -692,9 +698,11 @@ credit_flow(Config) ->
                     5000),
 
                   %% There should be only one process with a message buildup
-                  [{WriterPid, MQLen, _}, {_, 0, _} | _] =
+                  Top = [{WriterPid, MQLen, _}, {_, P, _} | _] =
                       rabbit_ct_broker_helpers:rpc(
                         Config, 0, recon, proc_count, [message_queue_len, 10]),
+                  ct:pal("Top processes by message queue length: ~p", [Top]),
+                  ?assert(P < 3),
 
                   %% The writer process should have only a limited
                   %% message queue. The shovel stops sending messages
@@ -721,9 +729,10 @@ credit_flow(Config) ->
                     end,
                     5000),
                   #{messages := 1000} = message_count(Config, <<"dest">>),
-                  [{_, 0, _}] =
+                  [{_, P, _}] =
                       rabbit_ct_broker_helpers:rpc(
                         Config, 0, recon, proc_count, [message_queue_len, 1]),
+                  ?assert(P < 3),
 
                   %% Status only transitions from flow to running
                   %% after a 1 second state-change-interval
@@ -835,9 +844,12 @@ dest_resource_alarm(AckMode, Config) ->
                   MsgCnts = message_count(Config, <<"src">>),
 
                   %% There should be no process with a message buildup
-                  [{_, 0, _}] =
-                      rabbit_ct_broker_helpers:rpc(
-                        Config, 0, recon, proc_count, [message_queue_len, 1]),
+                  eventually(?_assertEqual(0, begin
+                      Top = [{_, P, _}] = rabbit_ct_broker_helpers:rpc(
+                          Config, 0, recon, proc_count, [message_queue_len, 1]),
+                      ct:pal("Top process by message queue length: ~p", [Top]),
+                      P
+                  end)),
 
                   %% Clear the resource alarm, all messages should
                   %% arrive to the dest queue

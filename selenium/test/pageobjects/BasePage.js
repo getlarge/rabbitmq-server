@@ -13,8 +13,13 @@ const EXCHANGES_TAB = By.css('div#menu ul#tabs li#exchanges')
 const ADMIN_TAB = By.css('div#menu ul#tabs li#admin')
 const STREAM_CONNECTIONS_TAB = By.css('div#menu ul#tabs li#stream-connections')
 
-const FORM_POPUP = By.css('div.form-popup-warn')
-const FORM_POPUP_CLOSE_BUTTON = By.css('div.form-popup-warn span')
+const FORM_POPUP_WARNING = By.css('div.form-popup-warn')
+const FORM_POPUP_WARNING_CLOSE_BUTTON = By.css('div.form-popup-warn span#close')
+
+const FORM_POPUP_OPTIONS = By.css('div.form-popup-options')
+const ADD_MINUS_BUTTON = By.css('div#main table.list thead tr th.plus-minus')
+const TABLE_COLUMNS_POPUP = By.css('div.form-popup-options table.form')
+const FORM_POPUP_OPTIONS_CLOSE_BUTTON = By.css('div.form-popup-options span#close')
 
 module.exports = class BasePage {
   driver
@@ -44,7 +49,9 @@ module.exports = class BasePage {
   async selectRefreshOption(option) {
     return this.selectOption(SELECT_REFRESH, option)
   }
+  
   async waitForOverviewTab() {
+    await this.driver.sleep(250)
     return this.waitForDisplayed(OVERVIEW_TAB)
   }
 
@@ -56,6 +63,7 @@ module.exports = class BasePage {
     return this.click(CONNECTIONS_TAB)
   }
   async waitForConnectionsTab() {
+    await this.driver.sleep(250)
     return this.waitForDisplayed(CONNECTIONS_TAB)
   }
 
@@ -63,6 +71,7 @@ module.exports = class BasePage {
     return this.click(ADMIN_TAB)
   }
   async waitForAdminTab() {
+    await this.driver.sleep(250)
     return this.waitForDisplayed(ADMIN_TAB)
   }
 
@@ -70,6 +79,7 @@ module.exports = class BasePage {
     return this.click(CHANNELS_TAB)
   }
   async waitForChannelsTab() {
+    await this.driver.sleep(250)
     return this.waitForDisplayed(CHANNELS_TAB)
   }
 
@@ -77,6 +87,7 @@ module.exports = class BasePage {
     return this.click(EXCHANGES_TAB)
   }
   async waitForExchangesTab() {
+    await this.driver.sleep(250)
     return this.waitForDisplayed(EXCHANGES_TAB)
   }
 
@@ -114,6 +125,11 @@ module.exports = class BasePage {
     const select = await new Select(selectable)
     return select.selectByVisibleText(text)
   }
+  async selectOptionByValue(locator, value) {
+    let selectable = await this.waitForDisplayed(locator)
+    const select = await new Select(selectable)
+    return select.selectByValue(value)
+  }
 
   async getSelectableVhosts() {
     const table_model = await this.getSelectableOptions(SELECT_VHOSTS)
@@ -125,6 +141,7 @@ module.exports = class BasePage {
   }
 
 
+
   async getTable(tableLocator, firstNColumns, rowClass) {
     const table = await this.waitForDisplayed(tableLocator)
     const rows = await table.findElements(rowClass == undefined ? 
@@ -134,7 +151,9 @@ module.exports = class BasePage {
       let columns = await row.findElements(By.css('td'))
       let table_row = []
       for (let column of columns) {
-        if (table_row.length < firstNColumns) table_row.push(await column.getText())
+        if (firstNColumns == undefined || table_row.length < firstNColumns) {
+          table_row.push(await column.getText())
+        }
       }
       table_model.push(table_row)
     }
@@ -142,7 +161,7 @@ module.exports = class BasePage {
   }
   async isPopupWarningDisplayed() {
     try  {      
-      let element = await driver.findElement(FORM_POPUP)
+      let element = await driver.findElement(FORM_POPUP_WARNING)
       return element.isDisplayed()
     } catch(e) {
       return Promise.resolve(false)
@@ -158,15 +177,67 @@ module.exports = class BasePage {
       })
       */
   }
+  
+  async isPopupWarningNotDisplayed() {
+    return this.isElementNotVisible(FORM_POPUP_WARNING)
+  }
+
+  async isElementNotVisible(locator) {
+    try {
+      await this.driver.wait(async() => {
+        try {
+          const element = await this.driver.findElement(locator)
+          const visible = await element.isDisplayed()
+          return !visible
+        } catch (error) {
+          return true
+        }
+      }, this.timeout)
+      return true
+    } catch (error) {
+      return false
+    }
+  }
   async getPopupWarning() {
-    let element = await driver.findElement(FORM_POPUP)
+    let element = await driver.findElement(FORM_POPUP_WARNING)
     return this.driver.wait(until.elementIsVisible(element), this.timeout,
       'Timed out after [timeout=' + this.timeout + ';polling=' + this.polling + '] awaiting till visible ' + element,
       this.polling).getText().then((value) => value.substring(0, value.search('\n\nClose')))
   }
   async closePopupWarning() {
-    return this.click(FORM_POPUP_CLOSE_BUTTON)
+    return this.click(FORM_POPUP_WARNING_CLOSE_BUTTON)
   }
+  async clickOnSelectTableColumns() {
+    return this.click(ADD_MINUS_BUTTON)
+  }
+  async getSelectableTableColumns() {
+    const table = await this.waitForDisplayed(TABLE_COLUMNS_POPUP)
+    const rows = await table.findElements(By.css('tbody tr'))
+    let table_model = []
+    for (let i = 1; i < rows.length; i++) { // skip first row      
+      let groupNameLabel = await rows[i].findElement(By.css('th label'))
+      let groupName = await groupNameLabel.getText()
+      let columns = await rows[i].findElements(By.css('td label'))
+      let table_row = []
+      for (let column of columns) {
+        let checkbox = await column.findElement(By.css('input'))
+        table_row.push({"name:" : await column.getText(), "id" : await checkbox.getAttribute("id")})
+      }
+      let group = {"name": groupName, "columns": table_row}
+      table_model.push(group)
+    }
+    return table_model
+  }
+  async selectTableColumnsById(arrayOfColumnsIds) {
+    await this.clickOnSelectTableColumns()
+    const table = await this.waitForDisplayed(TABLE_COLUMNS_POPUP)
+    for (let id of arrayOfColumnsIds) {
+      let checkbox = await table.findElement(By.css('tbody tr input#'+id))
+      await checkbox.click()
+    }
+    await this.click(FORM_POPUP_OPTIONS_CLOSE_BUTTON)
+  }
+
   async isDisplayed(locator) {
       try {
         let element = await driver.findElement(locator)
@@ -180,42 +251,69 @@ module.exports = class BasePage {
   }
 
   async waitForLocated (locator) {
-    try {
-      return this.driver.wait(until.elementLocated(locator), this.timeout,
-        'Timed out after [timeout=' + this.timeout + ';polling=' + this.polling + '] seconds locating ' + locator,
-        this.polling)
-    }catch(error) {
-      if (!error.name.includes("NoSuchSessionError")) {
-        console.error("Failed waitForLocated " + locator + " due to " + error)
-      }
-      throw error
-    }
+    let attempts = 3
+    let retry = false
+    let rethrowError = null
+    do {
+      try {
+        return this.driver.wait(until.elementLocated(locator), this.timeout,
+          'Timed out after [timeout=' + this.timeout + ';polling=' + this.polling + '] seconds locating ' + locator,
+          this.polling)
+      }catch(error) {
+        if (error.name.includes("StaleElementReferenceError")) {
+          retry = true
+        }else if (!error.name.includes("NoSuchSessionError")) {
+          console.error("Failed waitForLocated " + locator + " due to " + error)
+          retry = false
+        }
+        rethrowError = error
+      }  
+    } while (retry && --attempts > 0)
+    throw rethrowError
   }
 
   async waitForVisible (element) {
-    try {
-      return this.driver.wait(until.elementIsVisible(element), this.timeout,
-        'Timed out after [timeout=' + this.timeout + ';polling=' + this.polling + '] awaiting till visible ' + element,
-        this.polling)
-    }catch(error) {      
-      if (!error.name.includes("NoSuchSessionError")) {
-        console.error("Failed to find visible element " + element + " due to " + error)
+    let attempts = 3
+    let retry = false
+    let rethrowError = null
+    do {      
+      try {
+        return this.driver.wait(until.elementIsVisible(element), this.timeout,
+          'Timed out after [timeout=' + this.timeout + ';polling=' + this.polling + '] awaiting till visible ' + element,
+          this.polling)
+      }catch(error) {         
+        if (error.name.includes("StaleElementReferenceError")) {
+          retry = true
+        }else if (!error.name.includes("NoSuchSessionError")) {
+          console.error("Failed to find visible element " + element + " due to " + error)
+          retry = false
+        }        
+        rethrowError = error
       }
-      throw error
-    }
+    } while (retry && --attempts > 0)
+    throw rethrowError
   }
 
 
   async waitForDisplayed (locator) {
-    if (this.interactionDelay && this.interactionDelay > 0) await this.driver.sleep(this.interactionDelay)
-    try {
-      return this.waitForVisible(await this.waitForLocated(locator))
-    }catch(error) {
-      if (!error.name.includes("NoSuchSessionError")) {
-        console.error("Failed to waitForDisplayed " + locator + " due to " + error)
-      }
-      throw error
-    }
+    let attempts = 3
+    let retry = false
+    let rethrowError = null
+    do {
+      if (this.interactionDelay && this.interactionDelay > 0) await this.driver.sleep(this.interactionDelay)
+        try {
+          return this.waitForVisible(await this.waitForLocated(locator))
+        }catch(error) {
+          if (error.name.includes("StaleElementReferenceError")) {
+            retry = true
+          }else if (!error.name.includes("NoSuchSessionError")) {
+            retry = false
+            console.error("Failed to waitForDisplayed " + locator + " due to " + error)
+          }
+          rethrowError = error
+        }
+    } while (retry && --attempts > 0 )
+    throw rethrowError
   }
 
   async getText (locator) {
