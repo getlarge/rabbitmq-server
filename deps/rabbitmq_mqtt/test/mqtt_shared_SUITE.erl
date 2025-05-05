@@ -1782,6 +1782,7 @@ message_interceptors(Config) ->
              [message_interceptors,
               [
                {rabbit_mqtt_msg_interceptor_client_id, #{}},
+               {rabbit_mqtt_msg_interceptor_username, #{}},
                {rabbit_msg_interceptor_timestamp, #{overwrite => false,
                                                     incoming => true,
                                                     outgoing => true}}
@@ -1820,6 +1821,9 @@ message_interceptors(Config) ->
 
     ?assertEqual({<<"x-opt-mqtt-client-id">>, longstr, ClientId},
                  lists:keyfind(<<"x-opt-mqtt-client-id">>, 1, Headers)),
+
+    ?assertEqual({<<"x-opt-mqtt-username">>, longstr, <<"guest">>},
+                 lists:keyfind(<<"x-opt-mqtt-username">>, 1, Headers)),
 
     #'basic.qos_ok'{}  = amqp_channel:call(Ch, #'basic.qos'{prefetch_count = 1}),
     CTag = <<"my ctag">>,

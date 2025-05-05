@@ -332,6 +332,15 @@ end}.
            false ->
              Acc
          end;
+        ({["mqtt", "message_interceptors", "incoming", "set_username_annotation", "enabled"], Enabled}, Acc) ->
+         case Enabled of
+           true ->
+             Mod = rabbit_mqtt_msg_interceptor_username,
+             Cfg = #{},
+             [{Mod, Cfg} | Acc];
+           false ->
+             Acc
+         end;
         (Other, _Acc) ->
          cuttlefish:invalid(io_lib:format("~p is invalid", [Other]))
     end, [], L)
