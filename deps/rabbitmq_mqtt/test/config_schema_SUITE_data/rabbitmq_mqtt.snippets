@@ -106,11 +106,11 @@
  {ssl_cert_login_other_name_san_type,
   "mqtt.ssl_cert_login_san_type = other_name",
   [{rabbitmq_mqtt,[{ssl_cert_login_san_type,other_name}]}],
-  [rabbitmq_mqtt]},    
+  [rabbitmq_mqtt]},
  {ssl_cert_login_san_index,
   "mqtt.ssl_cert_login_san_index = 0",
   [{rabbitmq_mqtt,[{ssl_cert_login_san_index,0}]}],
-  [rabbitmq_mqtt]},   
+  [rabbitmq_mqtt]},
  {proxy_protocol,
   "listeners.tcp.default = 5672
    mqtt.allow_anonymous  = true
@@ -175,15 +175,18 @@
 
   {message_interceptor_enabled,
    "mqtt.message_interceptors.incoming.set_client_id_annotation.enabled = true",
+   "mqtt.message_interceptors.incoming.set_username_annotation.enabled = true",
    [{rabbitmq_mqtt, [
       {message_interceptors, [
-        {rabbit_mqtt_msg_interceptor_client_id, #{}}
+        {rabbit_mqtt_msg_interceptor_client_id, #{}},
+        {rabbit_mqtt_msg_interceptor_username, #{}},
       ]}
      ]}],
    []},
 
   {message_interceptor_disabled,
    "mqtt.message_interceptors.incoming.set_client_id_annotation.enabled = false",
+   "mqtt.message_interceptors.incoming.set_username_annotation.enabled = false",
    [{rabbitmq_mqtt, [
       {message_interceptors, []}
      ]}],
