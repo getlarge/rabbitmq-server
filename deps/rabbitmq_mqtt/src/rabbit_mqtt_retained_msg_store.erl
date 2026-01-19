@@ -20,103 +20,97 @@
 
 -include("rabbit_mqtt.hrl").
 -include("rabbit_mqtt_packet.hrl").
+
 -include_lib("kernel/include/logger.hrl").
+
 -export([start/1, insert/3, lookup/2, delete/2, terminate/1]).
--export([expire/2]).
+-export([expire/2, get_max_retained_messages_count/0]).
+
 -export_type([state/0, expire/0]).
 
 -define(STATE, ?MODULE).
--record(?STATE, {store_mod :: module(),
-                 store_state :: term()}).
+
+-record(?STATE, {store_mod :: module(), store_state :: term()}).
+
 -opaque state() :: #?STATE{}.
 
--type expire() :: #{topic() :=
-                    {InsertionTimestamp :: integer(),
-                     MessageExpiryInterval :: pos_integer()}}.
+-type expire() ::
+    #{topic() := {InsertionTimestamp :: integer(), MessageExpiryInterval :: pos_integer()}}.
 
--callback new(Directory :: file:name_all(), rabbit_types:vhost()) ->
-    State :: any().
-
+-callback new(Directory :: file:name_all(), rabbit_types:vhost()) -> State :: any().
 -callback recover(Directory :: file:name_all(), rabbit_types:vhost()) ->
-    {ok, State :: any(), expire()} |
-    {error, uninitialized}.
-
--callback insert(topic(), mqtt_msg(), State :: any()) ->
-    ok.
-
--callback lookup(topic(), State :: any()) ->
-    mqtt_msg() | mqtt_msg_v0() | undefined.
-
--callback delete(topic(), State :: any()) ->
-    ok.
-
--callback terminate(State :: any()) ->
-    ok.
+                     {ok, State :: any(), expire()} | {error, uninitialized}.
+-callback insert(topic(), mqtt_msg(), State :: any()) -> ok.
+-callback lookup(topic(), State :: any()) -> [mqtt_msg()] | [mqtt_msg_v0()] | [].
+-callback delete(topic(), State :: any()) -> ok.
+-callback terminate(State :: any()) -> ok.
 
 -spec start(rabbit_types:vhost()) -> {state(), expire()}.
 start(VHost) ->
     {ok, Mod} = application:get_env(?APP_NAME, retained_message_store),
     Dir = rabbit:data_dir(),
-    ?LOG_INFO("Starting MQTT retained message store ~s for vhost '~ts'",
-              [Mod, VHost]),
-    {S, Expire} = case Mod:recover(Dir, VHost) of
-                      {ok, StoreState, Expire0} ->
-                          ?LOG_INFO("Recovered MQTT retained message store ~s for vhost '~ts'",
-                                    [Mod, VHost]),
-                          {StoreState, Expire0};
-                      {error, uninitialized} ->
-                          StoreState = Mod:new(Dir, VHost),
-                          ?LOG_INFO("Initialized MQTT retained message store ~s for vhost '~ts'",
-                                    [Mod, VHost]),
-                          {StoreState, #{}}
-                  end,
-    {#?STATE{store_mod = Mod,
-             store_state = S}, Expire}.
+    ?LOG_INFO("Starting MQTT retained message store ~s for vhost '~ts'", [Mod, VHost]),
+    {S, Expire} =
+        case Mod:recover(Dir, VHost) of
+            {ok, StoreState, Expire0} ->
+                ?LOG_INFO("Recovered MQTT retained message store ~s for vhost '~ts'", [Mod, VHost]),
+                {StoreState, Expire0};
+            {error, uninitialized} ->
+                StoreState = Mod:new(Dir, VHost),
+                ?LOG_INFO("Initialized MQTT retained message store ~s for vhost '~ts'",
+                          [Mod, VHost]),
+                {StoreState, #{}}
+        end,
+    {#?STATE{store_mod = Mod, store_state = S}, Expire}.
 
 -spec insert(topic(), mqtt_msg(), state()) -> ok.
-insert(Topic, Msg, #?STATE{store_mod = Mod,
-                           store_state = StoreState}) ->
+insert(Topic, Msg, #?STATE{store_mod = Mod, store_state = StoreState}) ->
     ok = Mod:insert(Topic, Msg, StoreState).
 
--spec lookup(topic(), state()) ->
-    mqtt_msg() | undefined.
-lookup(Topic, #?STATE{store_mod = Mod,
-                      store_state = StoreState}) ->
+-spec lookup(topic(), state()) -> [mqtt_msg()] | [].
+lookup(Topic, #?STATE{store_mod = Mod, store_state = StoreState}) ->
     case Mod:lookup(Topic, StoreState) of
-        OldMsg when is_record(OldMsg, mqtt_msg, 7) ->
-            convert_mqtt_msg(OldMsg);
-        Other ->
-            Other
+        % Handle list of messages - convert any old format ones
+        Messages when is_list(Messages) ->
+            lists:map(fun (Msg) when is_record(Msg, mqtt_msg, 7) ->
+                              convert_mqtt_msg(Msg);
+                          (Msg) ->
+                              Msg
+                      end,
+                      Messages);
+        undefined ->
+            [];
+        [] ->
+            []
     end.
 
 -spec delete(topic(), state()) -> ok.
-delete(Topic, #?STATE{store_mod = Mod,
-                      store_state = StoreState}) ->
+delete(Topic, #?STATE{store_mod = Mod, store_state = StoreState}) ->
     ok = Mod:delete(Topic, StoreState).
 
 -spec terminate(state()) -> ok.
-terminate(#?STATE{store_mod = Mod,
-                  store_state = StoreState}) ->
+terminate(#?STATE{store_mod = Mod, store_state = StoreState}) ->
     ok = Mod:terminate(StoreState).
 
 -spec expire(ets | dets, ets:tid() | dets:tab_name()) -> expire().
 expire(Mod, Tab) ->
     Now = os:system_time(second),
-    Mod:foldl(
-      fun(#retained_message{topic = Topic,
-                            mqtt_msg = #mqtt_msg{props = #{'Message-Expiry-Interval' := Expiry},
-                                                 timestamp = Timestamp}}, Acc)
-            when is_integer(Expiry) andalso
-                 is_integer(Timestamp) ->
-              if Now - Timestamp >= Expiry ->
-                     Mod:delete(Tab, Topic),
-                     Acc;
-                 true ->
-                     maps:put(Topic, {Timestamp, Expiry}, Acc)
-              end;
-         (_, Acc) ->
-              Acc
-      end, #{}, Tab).
+    ExpireMsg =
+        fun ({NodeId,
+              Topic,
+              #mqtt_msg{props = #{'Message-Expiry-Interval' := Expiry}, timestamp = Timestamp}},
+             Acc)
+                when is_integer(Expiry) andalso is_integer(Timestamp) ->
+                if Now - Timestamp >= Expiry ->
+                       Mod:delete(Tab, NodeId),
+                       Acc;
+                   true ->
+                       maps:put(Topic, {Timestamp, Expiry}, Acc)
+                end;
+            (_, Acc) ->
+                Acc
+        end,
+    Mod:foldl(ExpireMsg, #{}, Tab).
 
 %% Retained messages written in 3.12 (or earlier) are converted when read in 3.13 (or later).
 -spec convert_mqtt_msg(mqtt_msg_v0()) -> mqtt_msg().
@@ -128,3 +122,9 @@ convert_mqtt_msg({mqtt_msg, Retain, Qos, Topic, Dup, PacketId, Payload}) ->
               packet_id = PacketId,
               payload = Payload,
               props = #{}}.
+
+-spec get_max_retained_messages_count() -> pos_integer().
+get_max_retained_messages_count() ->
+    rabbit_misc:get_env(rabbit_mqtt,
+                        retained_message_store_max_retained_messages_count,
+                        2000).

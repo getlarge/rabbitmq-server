@@ -15,14 +15,16 @@
 
 -compile(export_all).
 
--import(rabbit_federation_test_util,
-        [expect/3, expect/4, expect_empty/2]).
+-import(exchange_federation_test_helpers,
+        [expect/3, expect/4, expect_empty/2, await_running_federation/3,
+         setup_federation_with_upstream_params/2]).
 
 all() ->
     [
       {group, essential},
       {group, cluster_size_3},
-      {group, rolling_upgrade}
+      {group, rolling_upgrade},
+      {group, maintenance_mode}
     ].
 
 groups() ->
@@ -35,7 +37,10 @@ groups() ->
                             ]},
      {channel_use_mod_single, [], [
                                    %% TBD: port from v3.10.x in an Erlang 25-compatible way
-                                  ]}
+                                  ]},
+     {maintenance_mode, [], [
+                             maintenance_mode_disconnect_reconnect
+                            ]}
     ].
 
 essential() ->
@@ -50,11 +55,12 @@ essential() ->
       unbind_on_delete,
       unbind_on_client_unbind,
       exchange_federation_link_status,
-      lookup_exchange_status
+      lookup_exchange_status,
+      supervisor_shutdown_concurrency_safety
     ].
 
 suite() ->
-    [{timetrap, {minutes, 3}}].
+    [{timetrap, {minutes, 2}}].
 
 %% -------------------------------------------------------------------
 %% Setup/teardown.
@@ -71,7 +77,7 @@ end_per_suite(Config) ->
 init_per_group(essential, Config) ->
   SetupFederation = [
       fun(Config1) ->
-          rabbit_federation_test_util:setup_federation_with_upstream_params(Config1, [
+          setup_federation_with_upstream_params(Config1, [
               {<<"channel-use-mode">>, <<"single">>}
           ])
       end
@@ -96,6 +102,19 @@ init_per_group(rolling_upgrade = Group, Config) ->
       {rmq_nodes_clustered, false}
     ]),
   init_per_group1(Group, Config1);
+init_per_group(maintenance_mode, Config) ->
+  Suffix = rabbit_ct_helpers:testcase_absname(Config, "", "-"),
+  Config1 = rabbit_ct_helpers:set_config(Config, [
+      {rmq_nodename_suffix, Suffix},
+      {rmq_nodes_count, 1},
+      %% When a node is put into maintenance mode, its connections are forcibly closed which causes
+      %% Erlang AMQP 0-9-1 client connection processes to terminate abruptly.
+      %% Ignore such crashes in the logs.
+      {ignored_crashes, ["socket_closed"]}
+    ]),
+  rabbit_ct_helpers:run_steps(Config1,
+    rabbit_ct_broker_helpers:setup_steps() ++
+    rabbit_ct_client_helpers:setup_steps());
 init_per_group(Group, Config) ->
   init_per_group1(Group, Config).
 
@@ -578,6 +597,74 @@ lookup_exchange_status(Config) ->
 
   clean_up_federation_related_bits(Config).
 
+%% Stops the federation supervisor concurrently with runtime parameter
+%% changes and exchange deletion.
+supervisor_shutdown_concurrency_safety(Config) ->
+  FedX = <<"shutdown_race.federated">>,
+  FedX2 = <<"shutdown_race.federated2">>,
+  UpX = <<"shutdown_race.upstream.x">>,
+  rabbit_ct_broker_helpers:set_parameter(
+    Config, 0, <<"federation-upstream">>, <<"localhost">>,
+    [
+      {<<"uri">>,      rabbit_ct_broker_helpers:node_uri(Config, 0)},
+      {<<"exchange">>, UpX}
+    ]),
+  rabbit_ct_broker_helpers:set_policy(
+    Config, 0,
+    <<"fed.x">>, <<"^shutdown_race.federated">>, <<"exchanges">>,
+    [
+      {<<"federation-upstream">>, <<"localhost">>}
+    ]),
+
+  Ch = rabbit_ct_client_helpers:open_channel(Config, 0),
+  Xs = [exchange_declare_method(FedX), exchange_declare_method(FedX2)],
+  declare_exchanges(Ch, Xs),
+
+  RK = <<"key">>,
+  Q = declare_and_bind_queue(Ch, FedX, RK),
+  _ = declare_and_bind_queue(Ch, FedX2, RK),
+  await_binding(Config, 0, UpX, RK),
+
+  %% Verify federation is working
+  publish_expect(Ch, UpX, RK, Q, <<"before_shutdown">>),
+
+  %% Stop the federation supervisor directly (simulating shutdown)
+  ct:pal("Stopping federation supervisor to simulate shutdown race"),
+  ok = rabbit_ct_broker_helpers:rpc(Config, 0,
+         rabbit_exchange_federation_sup, stop, []),
+
+  %% Now trigger operations that would normally crash without the fix.
+  %% These should return ok, not crash with {noproc, _}
+
+  %% Test adjust/1 - this is called when parameters change
+  ct:pal("Calling adjust/1 after supervisor stopped"),
+  ok = rabbit_ct_broker_helpers:rpc(Config, 0,
+         rabbit_federation_exchange_link_sup_sup, adjust, [everything]),
+  ok = rabbit_ct_broker_helpers:rpc(Config, 0,
+         rabbit_federation_exchange_link_sup_sup, adjust,
+         [{clear_upstream, <<"/">>, <<"test-upstream">>}]),
+
+  %% Test stop_child/1 by deleting a federated exchange while the supervisor is down.
+  %% This triggers the decorator's delete callback, which calls stop_child.
+  ct:pal("Deleting federated exchange after supervisor stopped"),
+  delete_exchange(Ch, FedX2),
+
+  %% Test that the plugin can be cleanly disabled and re-enabled
+  %% even after this manual supervisor stop
+  ct:pal("Disabling and re-enabling plugin"),
+  ok = rabbit_ct_broker_helpers:disable_plugin(Config, 0, "rabbitmq_exchange_federation"),
+  ok = rabbit_ct_broker_helpers:enable_plugin(Config, 0, "rabbitmq_exchange_federation"),
+
+  await_running_federation(Config,
+    [{FedX, UpX}],
+    30000),
+
+  %% Verify federation still works after recovery
+  await_binding(Config, 0, UpX, RK),
+  publish_expect(Ch, UpX, RK, Q, <<"after_recovery">>),
+
+  clean_up_federation_related_bits(Config).
+
 child_id_format(Config) ->
   case rabbit_ct_helpers:is_mixed_versions() of
     true ->
@@ -697,6 +784,62 @@ child_id_format(Config) ->
           end;
       false ->
           {skip, "Should only run in mixed version environments"}
+  end.
+
+maintenance_mode_disconnect_reconnect(Config) ->
+  LinkCount = 5,
+  Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+  Uri = rabbit_ct_broker_helpers:node_uri(Config, 0),
+
+  Exchanges = [list_to_binary(io_lib:format("maintenance.fed.x.~b", [N]))
+               || N <- lists:seq(1, LinkCount)],
+  UpstreamExchanges = [list_to_binary(io_lib:format("maintenance.upstream.x.~b", [N]))
+                       || N <- lists:seq(1, LinkCount)],
+
+  lists:foreach(
+    fun({Idx, UpX}) ->
+        Name = list_to_binary(io_lib:format("upstream-~b", [Idx])),
+        rabbit_ct_broker_helpers:set_parameter(
+          Config, 0, <<"federation-upstream">>, Name,
+          [{<<"uri">>, Uri}, {<<"exchange">>, UpX}])
+    end,
+    lists:zip(lists:seq(1, LinkCount), UpstreamExchanges)),
+
+  rabbit_ct_broker_helpers:set_policy(
+    Config, 0,
+    <<"maintenance-fed-policy">>, <<"^maintenance\\.fed\\.x\\.">>, <<"exchanges">>,
+    [{<<"federation-upstream-pattern">>, <<"upstream-">>}]),
+
+  Ch = rabbit_ct_client_helpers:open_channel(Config, 0),
+  [declare_exchange(Ch, exchange_declare_method(X)) || X <- Exchanges],
+
+  rabbit_ct_helpers:await_condition(
+    fun() -> count_running_links(Config, Server) >= LinkCount end,
+    15000),
+
+  ok = rabbit_ct_broker_helpers:drain_node(Config, Server),
+
+  rabbit_ct_helpers:await_condition(
+    fun() -> count_running_links(Config, Server) =:= 0 end,
+    10000),
+
+  ok = rabbit_ct_broker_helpers:revive_node(Config, Server),
+
+  rabbit_ct_helpers:await_condition(
+    fun() -> count_running_links(Config, Server) >= LinkCount end,
+    15000),
+
+  rabbit_ct_client_helpers:close_channel(Ch),
+  clean_up_federation_related_bits(Config).
+
+count_running_links(Config, Server) ->
+  Status = rabbit_ct_broker_helpers:rpc(Config, Server,
+                                        rabbit_federation_status, status, []),
+  case Status of
+    {badrpc, _} -> 0;
+    List ->
+      length([S || S <- List,
+                   proplists:get_value(status, S) =:= running])
   end.
 
 %%
@@ -861,18 +1004,12 @@ await_binding(Config, Node, Vhost, X, Key, ExpectedBindingCount) when is_integer
   Attempts = 100,
   await_binding(Config, Node, Vhost, X, Key, ExpectedBindingCount, Attempts).
 
-await_binding(_Config, _Node, _Vhost, _X, _Key, ExpectedBindingCount, 0) ->
-  {error, rabbit_misc:format("expected ~b bindings but they did not materialize in time", [ExpectedBindingCount])};
-await_binding(Config, Node, Vhost, X, Key, ExpectedBindingCount, AttemptsLeft) when is_integer(ExpectedBindingCount) ->
-    case bound_keys_from(Config, Node, Vhost, X, Key) of
-        Bs when length(Bs) < ExpectedBindingCount ->
-            timer:sleep(1000),
-            await_binding(Config, Node, Vhost, X, Key, ExpectedBindingCount, AttemptsLeft - 1);
-        Bs when length(Bs) =:= ExpectedBindingCount ->
-            ok;
-        Bs ->
-            {error, rabbit_misc:format("expected ~b bindings, got ~b", [ExpectedBindingCount, length(Bs)])}
-    end.
+await_binding(Config, Node, Vhost, X, Key, ExpectedBindingCount, _AttemptsLeft) when is_integer(ExpectedBindingCount) ->
+    rabbit_ct_helpers:await_condition(
+      fun() ->
+              Bs = bound_keys_from(Config, Node, Vhost, X, Key),
+              length(Bs) >= ExpectedBindingCount
+      end, 30000).
 
 await_bindings(Config, Node, X, Keys) ->
   [await_binding(Config, Node, X, Key) || Key <- Keys].
@@ -902,13 +1039,10 @@ publish(Ch, X, Key, Msg = #amqp_msg{}) ->
                                          routing_key = Key}, Msg).
 
 await_credentials_obfuscation_seeding_on_two_nodes(Config) ->
-  %% give credentials_obfuscation a moment to start and be seeded
   rabbit_ct_helpers:await_condition(fun() ->
     rabbit_ct_broker_helpers:rpc(Config, 0, credentials_obfuscation, enabled, []) and
     rabbit_ct_broker_helpers:rpc(Config, 1, credentials_obfuscation, enabled, [])
-  end),
-
-  timer:sleep(1000).
+  end, 10000).
 
 assert_federation_internal_queue_type(Config, Server, Expected) ->
     Qs = all_queues_on(Config, Server),

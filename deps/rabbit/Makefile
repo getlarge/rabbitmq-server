@@ -229,19 +229,15 @@ define ct_master.erl
 	{ok, Pid2, _} = peer:start(StartOpts#{name => "rabbit_shard2"}),
 	{ok, Pid3, _} = peer:start(StartOpts#{name => "rabbit_shard3"}),
 	{ok, Pid4, _} = peer:start(StartOpts#{name => "rabbit_shard4"}),
-	{ok, Pid5, _} = peer:start(StartOpts#{name => "rabbit_shard5"}),
 	peer:call(Pid1, net_kernel, set_net_ticktime, [5]),
 	peer:call(Pid2, net_kernel, set_net_ticktime, [5]),
 	peer:call(Pid3, net_kernel, set_net_ticktime, [5]),
 	peer:call(Pid4, net_kernel, set_net_ticktime, [5]),
-	peer:call(Pid5, net_kernel, set_net_ticktime, [5]),
 	peer:call(Pid1, persistent_term, put, [rabbit_ct_tcp_port_base, 16000]),
 	peer:call(Pid2, persistent_term, put, [rabbit_ct_tcp_port_base, 20000]),
 	peer:call(Pid3, persistent_term, put, [rabbit_ct_tcp_port_base, 24000]),
 	peer:call(Pid4, persistent_term, put, [rabbit_ct_tcp_port_base, 28000]),
-	peer:call(Pid5, persistent_term, put, [rabbit_ct_tcp_port_base, 32000]),
 	[{[_], {ok, Results}}] = ct_master_fork:run("$1"),
-	peer:stop(Pid5),
 	peer:stop(Pid4),
 	peer:stop(Pid3),
 	peer:stop(Pid2),
@@ -266,7 +262,7 @@ PARALLEL_CT_SET_2_D = queue_length_limits queue_parallel quorum_queue_member_rec
 PARALLEL_CT_SET_3_A = definition_import per_user_connection_channel_limit_partitions per_vhost_connection_limit_partitions policy priority_queue_recovery rabbit_fifo_v0 rabbit_stream_sac_coordinator_v4 rabbit_stream_sac_coordinator unit_credit_flow unit_queue_consumers unit_queue_location unit_quorum_queue
 PARALLEL_CT_SET_3_B = cluster_upgrade list_consumers_sanity_check list_queues_online_and_offline logging lqueue maintenance_mode rabbit_fifo_q
 PARALLEL_CT_SET_3_C = cli_forget_cluster_node feature_flags_v2 mc_unit message_size_limit metadata_store_migration
-PARALLEL_CT_SET_3_D = metadata_store_phase1 metrics mirrored_supervisor peer_discovery_classic_config proxy_protocol runtime_parameters unit_stats_and_metrics unit_supervisor2 unit_vm_memory_monitor
+PARALLEL_CT_SET_3_D = metadata_store_phase1 metrics mirrored_supervisor peer_discovery_classic_config proxy_protocol runtime_parameters unit_rabbit_vm unit_stats_and_metrics unit_supervisor2 unit_vm_memory_monitor
 
 PARALLEL_CT_SET_4_A = clustering_events rabbit_local_random_exchange rabbit_msg_interceptor rabbitmq_4_0_deprecations unit_pg_local unit_plugin_directories unit_plugin_versioning unit_policy_validators unit_priority_queue
 PARALLEL_CT_SET_4_B = per_user_connection_tracking per_vhost_connection_limit rabbit_fifo_dlx_integration rabbit_fifo_int unit_default_queue_type
@@ -308,19 +304,16 @@ define tpl_parallel_ct_test_spec
 {node, shard2, 'rabbit_shard2@localhost'}.
 {node, shard3, 'rabbit_shard3@localhost'}.
 {node, shard4, 'rabbit_shard4@localhost'}.
-{node, shard5, 'rabbit_shard5@localhost'}.
 
 {define, 'Set1', [$(call comma_list,$(addsuffix _SUITE,$1))]}.
 {define, 'Set2', [$(call comma_list,$(addsuffix _SUITE,$2))]}.
 {define, 'Set3', [$(call comma_list,$(addsuffix _SUITE,$3))]}.
 {define, 'Set4', [$(call comma_list,$(addsuffix _SUITE,$4))]}.
-{define, 'Set5', [$(call comma_list,$(addsuffix _SUITE,$5))]}.
 
 {suites, shard1, "test/", 'Set1'}.
 {suites, shard2, "test/", 'Set2'}.
 {suites, shard3, "test/", 'Set3'}.
 {suites, shard4, "test/", 'Set4'}.
-{suites, shard5, "test/", 'Set5'}.
 endef
 
 define parallel_ct_set_target
